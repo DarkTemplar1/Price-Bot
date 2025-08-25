@@ -13,14 +13,18 @@ Poprawki:
 - wybór pliku działa poprawnie, a ścieżka jest przekazywana do sortowni/dalej,
 - okna dialogowe mają ustawionego parenta, żeby były modalne względem bieżącego okna.
 """
-from __future__ import annotations
 
 import sys
 import subprocess
 from importlib.util import spec_from_file_location, module_from_spec
 from pathlib import Path
+from typing import Optional
+
 import tkinter as tk
 from tkinter import filedialog, messagebox
+
+# Dodane: import silnika Excela (jeśli używasz pandas/openpyxl gdzie indziej)
+import openpyxl  # noqa: F401
 
 DOZWOLONE_ROZSZERZENIA = {".xlsx", ".xls", ".xlsm", ".xlsb"}
 
@@ -28,10 +32,7 @@ APP_TITLE = "Wybór pliku Excel"
 SCRIPT_DALEJ = "dalej.py"
 
 
-
-
-
-def wybierz_plik_excel(pierwsze_okno: tk.Tk | tk.Toplevel | None = None) -> Path | None:
+def wybierz_plik_excel(pierwsze_okno: Optional[tk.Tk] = None) -> Optional[Path]:
     sciezka = filedialog.askopenfilename(
         parent=pierwsze_okno,
         title="Wybierz plik Excel",
@@ -60,8 +61,7 @@ def wybierz_plik_excel(pierwsze_okno: tk.Tk | tk.Toplevel | None = None) -> Path
     return p
 
 
-
-def otworz_sortownie(sciezka_pliku: Path | None, root: tk.Tk):
+def otworz_sortownie(sciezka_pliku: Optional[Path], root: tk.Tk):
     """
     Ukrywa main, ładuje sortownia.py PO ŚCIEŻCE i uruchamia modalnie run_modal(...).
     Sortownia pracuje na wybranym pliku (obsłuży też pliki zabezpieczone).
@@ -70,7 +70,7 @@ def otworz_sortownie(sciezka_pliku: Path | None, root: tk.Tk):
     sort_path = base / "sortownia.py"
 
     if not sort_path.exists():
-        messagebox.showerror("Błąd importu", f"Nie znaleziono pliku: {sort_path}")
+        messagebox.showerror("Błąd importu", f"Nie znaleziono pliku: {sort_path}", parent=root)
         return
 
     try:
@@ -81,13 +81,14 @@ def otworz_sortownie(sciezka_pliku: Path | None, root: tk.Tk):
         sys.modules["sortownia_modal"] = mod
         spec.loader.exec_module(mod)
     except Exception as e:
-        messagebox.showerror("Błąd importu", f"Nie można wczytać sortownia.py:\n{e}")
+        messagebox.showerror("Błąd importu", f"Nie można wczytać sortownia.py:\n{e}", parent=root)
         return
 
     if not hasattr(mod, "run_modal"):
         messagebox.showerror(
             "Błąd",
             "Plik sortownia.py nie zawiera funkcji run_modal(file_path: str | None).",
+            parent=root,
         )
         return
 
@@ -96,7 +97,7 @@ def otworz_sortownie(sciezka_pliku: Path | None, root: tk.Tk):
     try:
         mod.run_modal(str(sciezka_pliku) if sciezka_pliku else None)
     except Exception as e:
-        messagebox.showerror("Błąd sortowni", f"Wystąpił błąd w sortownia.py:\n{e}")
+        messagebox.showerror("Błąd sortowni", f"Wystąpił błąd w sortownia.py:\n{e}", parent=root)
     finally:
         root.deiconify()
         root.lift()
@@ -106,13 +107,10 @@ def otworz_sortownie(sciezka_pliku: Path | None, root: tk.Tk):
             pass
 
 
-def uruchom_skrypt_subprocess(script_name: str, sciezka_pliku: Path | None):
+def uruchom_skrypt_subprocess(script_name: str, sciezka_pliku: Optional[Path]):
     """
-    Dla 'dalej.py' – PRZED uruchomieniem kasuje pliki CSV _dane1/_dane2,
-    a potem startuje osobny proces Pythona z przekazaną ścieżką do Excela.
+    Dla 'dalej.py' – uruchamia osobny proces Pythona z przekazaną ścieżką do Excela.
     """
-
-
     baza = Path(__file__).resolve().parent
     script_path = (baza / script_name).resolve()
     if not script_path.exists():
