@@ -5,7 +5,7 @@ sortownia.py — launcher filtrów
 
 Zmiany:
 • Lista (Combobox) z 3 opcjami i przycisk „Aktywuj filtr”.
-• DODANE: przycisk „poprawa_adresu”, który uruchamia popraw_adres.py.
+• DODANE: przyciski „poprawa_adresu” (uruchamia popraw_adres.py) oraz „cofnij filtry” (uruchamia cofnij.py).
 • Do skryptów przekazywana jest ścieżka pliku Excel jako:  --in <ścieżka>.
 
 Mapowanie:
@@ -13,6 +13,7 @@ Mapowanie:
     - „lokal mieszkalny” → LOKAL_MIESZKALNY.py
     - „Jeden właściciel i Lokal mieszkalny” → jeden_właściciel_i_LOKAL_MIESZKALNY.py
     - „poprawa_adresu” (guzik) → popraw_adres.py
+    - „cofnij filtry” (guzik) → cofnij.py
 """
 
 from __future__ import annotations
@@ -65,8 +66,8 @@ class SortowniaApp:
     def __init__(self, root: tk.Tk, start_path: str | None = None):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("640x300")
-        self.root.minsize(600, 280)
+        self.root.geometry("700x320")
+        self.root.minsize(680, 300)
 
         # bieżący plik Excel do przekazania w skryptach
         self.excel_path: Path | None = Path(start_path).expanduser() if start_path else None
@@ -104,12 +105,16 @@ class SortowniaApp:
         btn_fix = ttk.Button(box, text="poprawa_adresu", command=self._run_poprawa_adresu)
         btn_fix.pack(side="left", padx=(12, 0))
 
+        # DODANE: przycisk cofnij filtry
+        btn_undo = ttk.Button(box, text="cofnij filtry", command=self._run_cofnij)
+        btn_undo.pack(side="left", padx=(8, 0))
+
         # Status
         status = ttk.Frame(self.root, padding=12)
         status.pack(fill="both", expand=True)
         self.info_var = tk.StringVar(
-            value="Wybierz plik Excela, potem wybierz filtr z listy i kliknij „Aktywuj filtr”.\n"
-                  "Możesz też kliknąć „poprawa_adresu”, aby uruchomić popraw_adres.py."
+            value="Wybierz plik Excela, potem filtr z listy i kliknij „Aktywuj filtr”.\n"
+                  "Możesz też użyć „poprawa_adresu” (popraw_adres.py) lub „cofnij filtry” (cofnij.py)."
         )
         ttk.Label(status, textvariable=self.info_var, justify="left").pack(anchor="w")
 
@@ -154,6 +159,13 @@ class SortowniaApp:
             messagebox.showwarning("Brak pliku", "Najpierw wybierz plik Excela.")
             return
         self._run_script("popraw_adres.py")
+
+    def _run_cofnij(self):
+        """Uruchamia cofnij.py z parametrem --in <plik.xlsx> (przywrócenie po filtrach)."""
+        if self.excel_path is None:
+            messagebox.showwarning("Brak pliku", "Najpierw wybierz plik Excela.")
+            return
+        self._run_script("cofnij.py")
 
     def _run_script(self, script_name: str):
         """Wspólna logika uruchamiania zewnętrznego skryptu w nowym procesie."""

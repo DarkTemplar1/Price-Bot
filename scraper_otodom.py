@@ -566,4 +566,4 @@ def przetworz_linki_z_intake_csv(input_csv: str, output_csv: str):
 
 
 if __name__ == "__main__":
-    przetworz_linki_z_intake_csv("intake.csv", "wynik.csv")
+    przetworz_linki_z_intake_csv("intake.csv", "Baza_danych.xlsx")

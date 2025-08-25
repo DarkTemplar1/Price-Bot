@@ -27,21 +27,8 @@ DOZWOLONE_ROZSZERZENIA = {".xlsx", ".xls", ".xlsm", ".xlsb"}
 APP_TITLE = "Wybór pliku Excel"
 SCRIPT_DALEJ = "dalej.py"
 
-# Robocze pliki CSV tworzone obok wybranego Excela przez sortownię
-SHEET_DANE1 = "dane1"
-SHEET_DANE2 = "dane2"
 
 
-def _csv_paths_for_excel(sciezka_pliku: Path) -> tuple[Path, Path]:
-    """
-    Pliki robocze tworzymy obok Excela:
-      <nazwa_pliku>_dane1.csv oraz <nazwa_pliku>_dane2.csv
-    """
-    base = sciezka_pliku.with_suffix("")  # usuń rozszerzenie
-    return (
-        base.parent / f"{base.name}_{SHEET_DANE1}.csv",
-        base.parent / f"{base.name}_{SHEET_DANE2}.csv",
-    )
 
 
 def wybierz_plik_excel(pierwsze_okno: tk.Tk | tk.Toplevel | None = None) -> Path | None:
@@ -72,34 +59,6 @@ def wybierz_plik_excel(pierwsze_okno: tk.Tk | tk.Toplevel | None = None) -> Path
             pass
     return p
 
-
-def usun_pliki_robocze_csv(sciezka_pliku: Path) -> bool:
-    """
-    Zamiast usuwania arkuszy w Excelu usuwamy pliki:
-      <plik>_dane1.csv i <plik>_dane2.csv
-    """
-    suf = sciezka_pliku.suffix.lower()
-    if suf not in DOZWOLONE_ROZSZERZENIA:
-        messagebox.showinfo(
-            "Pomijam usuwanie plików",
-            f"Format {suf} nie jest obsługiwany. Kontynuuję bez kasowania.",
-        )
-        return True
-
-    p1, p2 = _csv_paths_for_excel(sciezka_pliku)
-    errs = []
-    for p in (p1, p2):
-        try:
-            if p.exists():
-                p.unlink()
-        except Exception as e:
-            errs.append(f"{p.name}: {e}")
-    if errs:
-        messagebox.showwarning(
-            "Nie wszystkie pliki usunięte",
-            "Nie udało się usunąć części plików CSV:\n- " + "\n- ".join(errs),
-        )
-    return True
 
 
 def otworz_sortownie(sciezka_pliku: Path | None, root: tk.Tk):
@@ -152,10 +111,7 @@ def uruchom_skrypt_subprocess(script_name: str, sciezka_pliku: Path | None):
     Dla 'dalej.py' – PRZED uruchomieniem kasuje pliki CSV _dane1/_dane2,
     a potem startuje osobny proces Pythona z przekazaną ścieżką do Excela.
     """
-    if sciezka_pliku is not None:
-        ok = usun_pliki_robocze_csv(sciezka_pliku)
-        if not ok:
-            return
+
 
     baza = Path(__file__).resolve().parent
     script_path = (baza / script_name).resolve()
