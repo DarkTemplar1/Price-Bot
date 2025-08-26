@@ -6,7 +6,9 @@ linki_mieszkania.py
 Zbiera linki do ofert „mieszkania” z Otodom i zapisuje je do CSV
 per-województwo: intake_<wojewodztwo>.csv (np. intake_mazowieckie.csv).
 
-- Jeśli plik istnieje, NIE jest nadpisywany – dopisywane są tylko nowe linki.
+- Domyślnie działa dla WSZYSTKICH województw (-r/--region all).
+- Automatycznie przechodzi przez WSZYSTKIE dostępne strony wyników.
+- Jeżeli plik istnieje, dopisuje tylko nowe linki (bez duplikatów).
 - Dla każdego dopisanego linku zapisuje datę i godzinę pobrania (Europe/Warsaw).
 """
 
@@ -19,7 +21,7 @@ import re
 import time
 import unicodedata
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, List
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 import requests
@@ -48,40 +50,79 @@ _RNG = SystemRandom()
 BASE_DIR = Path(__file__).resolve().parent
 
 WAIT_SECONDS = 20
-HEADLESS = False
 RETRIES_NAV = 3
-SCROLL_PAUSE = 0.6
-USE_SELENIUM = False  # <= domyślnie BEZ przeglądarki (stabilniej/faster)
+USE_SELENIUM = False  # domyślnie bez przeglądarki
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-VOIVODESHIPS = {
-    "dolnoslaskie": "Dolnośląskie",
-    "kujawsko-pomorskie": "Kujawsko-Pomorskie",
-    "lubelskie": "Lubelskie",
-    "lubuskie": "Lubuskie",
-    "lodzkie": "Łódzkie",
-    "malopolskie": "Małopolskie",
-    "mazowieckie": "Mazowieckie",
-    "opolskie": "Opolskie",
-    "podkarpackie": "Podkarpackie",
-    "podlaskie": "Podlaskie",
-    "pomorskie": "Pomorskie",
-    "slaskie": "Śląskie",
-    "swietokrzyskie": "Świętokrzyskie",
-    "warminsko-mazurskie": "Warmińsko-Mazurskie",
-    "wielkopolskie": "Wielkopolskie",
-    "zachodniopomorskie": "Zachodniopomorskie",
-}
+# Kolejność ustalona, by raport był przewidywalny
+VOIVODESHIPS_ORDERED: List[tuple[str, str]] = [
+    ("dolnoslaskie", "Dolnośląskie"),
+    ("kujawsko-pomorskie", "Kujawsko-Pomorskie"),
+    ("lubelskie", "Lubelskie"),
+    ("lubuskie", "Lubuskie"),
+    ("lodzkie", "Łódzkie"),
+    ("malopolskie", "Małopolskie"),
+    ("mazowieckie", "Mazowieckie"),
+    ("opolskie", "Opolskie"),
+    ("podkarpackie", "Podkarpackie"),
+    ("podlaskie", "Podlaskie"),
+    ("pomorskie", "Pomorskie"),
+    ("slaskie", "Śląskie"),
+    ("swietokrzyskie", "Świętokrzyskie"),
+    ("warminsko-mazurskie", "Warmińsko-Mazurskie"),
+    ("wielkopolskie", "Wielkopolskie"),
+    ("zachodniopomorskie", "Zachodniopomorskie"),
+]
+VOIVODESHIPS = dict(VOIVODESHIPS_ORDERED)
+DEFAULT_REGION = "all"  # <- teraz domyślnie wszystkie
 
-def _slugify_region(s: str) -> str:
-    s = s.strip().lower()
-    # pozwalamy na podanie etykiety z polskimi znakami – mapujemy do slugów
-    reverse = {v.lower(): k for k, v in VOIVODESHIPS.items()}
-    return VOIVODESHIPS.get(s, None) or reverse.get(s, None) or s  # s może już być slugiem
+
+def _slugify_region_input(raw: str) -> List[str]:
+    """
+    Przyjmuje:
+      - 'all'  → wszystkie slugi
+      - pojedynczy slug lub etykietę ('mazowieckie' / 'Mazowieckie')
+      - listę po przecinku ('mazowieckie,slaskie' lub 'Mazowieckie, Śląskie')
+    Zwraca listę SLUGÓW.
+    """
+    if not raw or raw.strip().lower() == "all":
+        return [slug for slug, _ in VOIVODESHIPS_ORDERED]
+
+    label_to_slug = {v.lower(): k for k, v in VOIVODESHIPS.items()}
+
+    out: List[str] = []
+    for part in raw.split(","):
+        s = part.strip().lower()
+        if not s:
+            continue
+        if s in VOIVODESHIPS:
+            out.append(s)
+        else:
+            # spróbuj mapowania z etykiety
+            slug = label_to_slug.get(s)
+            if slug:
+                out.append(slug)
+            else:
+                # dopuszczamy, ale zweryfikujemy niżej
+                out.append(s)
+    # walidacja
+    bad = [s for s in out if s not in VOIVODESHIPS]
+    if bad:
+        valid = ", ".join(VOIVODESHIPS.keys())
+        raise SystemExit(f"Nieznane województwo/slug: {', '.join(bad)}\nDozwolone slugi: {valid}\n"
+                         f"Albo użyj: --region all")
+    # deduplikacja z zachowaniem kolejności
+    seen = set()
+    uniq = []
+    for s in out:
+        if s not in seen:
+            uniq.append(s)
+            seen.add(s)
+    return uniq
 
 
 # ------------------------------ Utils ------------------------------
@@ -95,27 +136,11 @@ def add_or_replace_query_param(url: str, key: str, value: str) -> str:
 def _strip_accents(text: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
 
-def parse_total_offers(html: str) -> int | None:
-    for key in ("totalResults", "numberOfItems", "total", "resultsCount", "offersCount"):
-        m = re.search(rf'"{key}"\s*:\s*(\d+)', html)
-        if m:
-            try:
-                return int(m.group(1))
-            except ValueError:
-                continue
-    ascii_html = _strip_accents(html.lower())
-    m = re.search(r'([\d\s\.,]+)\s*oglosz', ascii_html)
-    if m:
-        try:
-            return int(re.sub(r"[^\d]", "", m.group(1)))
-        except ValueError:
-            pass
-    return None
-
 def parse_links_from_html(html: str, base_url: str) -> set[str]:
     soup = BeautifulSoup(html, "html.parser")
     links: set[str] = set()
 
+    # karty listingu
     for a in soup.select('a[data-cy="listing-item-link"][href]'):
         href = (a.get("href") or "").strip()
         if not href:
@@ -124,6 +149,7 @@ def parse_links_from_html(html: str, base_url: str) -> set[str]:
         if "/pl/oferta/" in full:
             links.add(full)
 
+    # JSON-LD
     for script in soup.find_all("script", {"type": "application/ld+json"}):
         raw = script.string or ""
         if not raw.strip():
@@ -153,6 +179,7 @@ def parse_links_from_html(html: str, base_url: str) -> set[str]:
         walk(data)
     return links
 
+
 # ------------------------------ FETCHERS ------------------------------
 class HttpFetcher:
     def __init__(self, wait_seconds: int = WAIT_SECONDS):
@@ -181,7 +208,7 @@ class HttpFetcher:
                 return True
             except Exception as e:
                 last_err = e
-                time.sleep(1.5 * (attempt + 1))
+                time.sleep(1.25 * (attempt + 1))
         print(f"[WARN] Nie udało się wczytać: {url} ({last_err})")
         return False
 
@@ -197,32 +224,50 @@ class HttpFetcher:
         except Exception:
             pass
 
-# (SeleniumFetcher pomijam – jak w Twojej wersji, nie zmieniałem)
 
 def _make_fetcher():
     return HttpFetcher(wait_seconds=WAIT_SECONDS)
 
-def collect_links_from_n_pages(search_url: str, pages: int = 1,
-                               delay_min: float = 1.5, delay_max: float = 6.0) -> list[str]:
+
+# ------------------------------ Core ------------------------------
+def collect_links_all_pages(search_url: str,
+                            min_delay: float = 1.2,
+                            max_delay: float = 4.5) -> list[str]:
+    """
+    Iteruje po stronach 1..N aż do wyczerpania wyników (brak nowych linków).
+    """
     fetcher = _make_fetcher()
     seen, out = set(), []
+    page = 1
     try:
-        for page in range(1, pages + 1):
+        while True:
             url = search_url if page == 1 else add_or_replace_query_param(search_url, "page", page)
-            if not fetcher.get(url):
+            ok = fetcher.get(url)
+            if not ok:
+                # jeżeli nie wczytało 1. strony – przerywamy; jeśli później – zakładamy koniec
+                if page == 1:
+                    print(f"[ERR] Nie udało się pobrać pierwszej strony: {url}")
                 break
             html = fetcher.page_source()
             base_url = fetcher.current_url() or search_url
             links = parse_links_from_html(html, base_url)
-            new = [u for u in links if u not in seen]
-            if not new and page > 1:
+
+            new_links = [u for u in links if u not in seen]
+            if not new_links:
+                # brak nowych linków → koniec paginacji
+                print(f"[INFO] Strona {page}: brak nowych linków – koniec.")
                 break
-            seen.update(new)
-            out.extend(new)
-            time.sleep(_RNG.uniform(delay_min, delay_max))
+
+            print(f"[INFO] Strona {page}: znaleziono {len(new_links)} nowych linków (łącznie {len(seen) + len(new_links)}).")
+            seen.update(new_links)
+            out.extend(new_links)
+
+            page += 1
+            time.sleep(_RNG.uniform(min_delay, max_delay))
     finally:
         fetcher.close()
     return out
+
 
 def _read_existing_links(csv_path: Path) -> set[str]:
     existing: set[str] = set()
@@ -248,6 +293,7 @@ def _read_existing_links(csv_path: Path) -> set[str]:
                     existing.add(u)
     return existing
 
+
 def append_links_with_timestamp(links: Iterable[str], csv_path: Path) -> int:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     existing = _read_existing_links(csv_path)
@@ -262,28 +308,49 @@ def append_links_with_timestamp(links: Iterable[str], csv_path: Path) -> int:
             w.writerow([u, now.date().isoformat(), now.time().isoformat(timespec="seconds")])
     return len(new)
 
+
+def run_for_region(slug: str) -> tuple[int, int]:
+    """
+    Zwraca (total_found, newly_appended)
+    """
+    start_url = (
+        f"https://www.otodom.pl/pl/wyniki/sprzedaz/mieszkanie/{slug}"
+        "?limit=36&ownerTypeSingleSelect=ALL&by=DEFAULT&direction=DESC"
+    )
+    csv_path = BASE_DIR / f"intake_{slug}.csv"
+
+    print(f"\n========== {VOIVODESHIPS[slug]} ({slug}) ==========")
+    print(f"[INFO] URL startowy: {start_url}")
+    print(f"[INFO] Plik intake:  {csv_path.name}")
+
+    links = collect_links_all_pages(start_url)
+    added = append_links_with_timestamp(links, csv_path)
+    print(f"[OK] Zebrano {len(links)} linków, dopisano {added} nowych do {csv_path.name}")
+    return (len(links), added)
+
+
 # --------------------------- CLI ---------------------------
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--region", "-r", required=True,
-                    help="Slug województwa (np. mazowieckie) lub etykieta (np. Mazowieckie).")
-    ap.add_argument("--pages", "-p", type=int, default=1, help="Ile stron wyników pobrać (domyślnie 1).")
+    ap.add_argument(
+        "--region", "-r",
+        default=DEFAULT_REGION,
+        help=("Slug/etykieta województwa (np. 'mazowieckie' lub 'Mazowieckie'), "
+              "lista po przecinku (np. 'mazowieckie,slaskie') lub 'all' (domyślnie).")
+    )
     args = ap.parse_args()
 
-    region_slug = _slugify_region(args.region)
-    if region_slug not in VOIVODESHIPS:
-        raise SystemExit(f"Nieznane województwo: {args.region}")
+    region_slugs = _slugify_region_input(args.region)
 
-    start_url = (
-        f"https://www.otodom.pl/pl/wyniki/sprzedaz/mieszkanie/{region_slug}"
-        "?limit=36&ownerTypeSingleSelect=ALL&by=DEFAULT&direction=DESC"
-    )
-    csv_path = BASE_DIR / f"intake_{region_slug}.csv"
+    total_found = 0
+    total_added = 0
+    for slug in region_slugs:
+        found, added = run_for_region(slug)
+        total_found += found
+        total_added += added
+        # mała przerwa między województwami
+        time.sleep(_RNG.uniform(1.0, 2.5))
 
-    print(f"[INFO] Województwo: {VOIVODESHIPS[region_slug]} ({region_slug})")
-    print(f"[INFO] URL startowy: {start_url}")
-    print(f"[INFO] Plik intake: {csv_path.name}")
-
-    links = collect_links_from_n_pages(start_url, pages=args.pages)
-    added = append_links_with_timestamp(links, csv_path)
-    print(f"[OK] Zebrano {len(links)} linków, dopisano {added} nowych do {csv_path.name}")
+    print("\n=========== PODSUMOWANIE ===========")
+    print(f"Łącznie znalezionych linków: {total_found}")
+    print(f"Łącznie NOWO dopisanych:     {total_added}")
