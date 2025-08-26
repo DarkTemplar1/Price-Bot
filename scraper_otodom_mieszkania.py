@@ -1,5 +1,8 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import argparse
 import csv
 import time
 import sys
@@ -7,42 +10,47 @@ from pathlib import Path
 from typing import Iterable, List, Dict
 from secrets import SystemRandom
 
-# ✅ alias zmieniony na `scpr`
+# alias do modułu z pobieraniem danych z pojedynczego ogłoszenia
 import scraper_otodom as scpr
 
-from EXCELoperacje import (
-    ensure_baza_mieszkania,
-    append_mieszkania_rows,
-    BAZA_MIESZKANIA_HEADERS,
-)
-
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_INTAKE = BASE_DIR / "intake.csv"
 
-DB_XLSX = BASE_DIR / "Baza_danych.xlsx"
-DB_SHEET = "Mieszkania"
+# kolumny zapisu (CSV)
+RESULT_HEADERS = [
+    "cena",
+    "cena_za_metr",
+    "metry",
+    "liczba_pokoi",
+    "pietro",
+    "rynek",
+    "rok_budowy",
+    "material",
+    "wojewodztwo",
+    "powiat",
+    "gmina",
+    "miejscowosc",
+    "dzielnica",
+    "ulica",
+    "link",
+]
 
 _rng = SystemRandom()
 DELAY_MIN = 3.0
 DELAY_MAX = 4.0
-
 
 def _sleep_random():
     delay = _rng.uniform(DELAY_MIN, DELAY_MAX)
     print(f"[sleep] odczekuję ~{delay:.2f} s…", flush=True)
     time.sleep(delay)
 
-
 def _read_links_from_csv(path: Path) -> List[str]:
-    """Czyta linki z 1. kolumny intake.csv, zaczynając od 2. wiersza."""
     links: List[str] = []
     if not path.exists() or path.stat().st_size == 0:
         print(f"[WARN] Brak pliku z linkami: {path}")
         return links
-
     with path.open("r", newline="", encoding="utf-8") as f:
         r = csv.reader(f)
-        next(r, None)  # pomiń 1. wiersz (nagłówek)
+        next(r, None)  # pomiń nagłówek
         for row in r:
             if not row:
                 continue
@@ -51,15 +59,40 @@ def _read_links_from_csv(path: Path) -> List[str]:
                 links.append(u)
     return links
 
-
-
 def _ensure_row_keys(row: Dict[str, str]) -> Dict[str, str]:
-    return {k: (row.get(k) or "").strip() for k in BAZA_MIESZKANIA_HEADERS}
+    return {k: (row.get(k) or "").strip() for k in RESULT_HEADERS}
 
+def _existing_result_links(out_csv: Path) -> set[str]:
+    """Zwraca zestaw linków już obecnych w pliku wynikowym (aby nie dublować)."""
+    existing: set[str] = set()
+    if not out_csv.exists() or out_csv.stat().st_size == 0:
+        return existing
+    with out_csv.open("r", newline="", encoding="utf-8-sig") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            u = (row.get("link") or "").strip()
+            if u:
+                existing.add(u)
+    return existing
+
+def _append_rows_to_csv(out_csv: Path, rows: List[Dict[str, str]]) -> int:
+    """Dopisuje wiersze do CSV, bez duplikacji po 'link'. Zwraca liczbę NOWO dodanych."""
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    existing_links = _existing_result_links(out_csv)
+    new_rows = [r for r in rows if (r.get("link") or "") not in existing_links]
+    if not new_rows:
+        return 0
+    write_header = not out_csv.exists() or out_csv.stat().st_size == 0
+    with out_csv.open("a", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=RESULT_HEADERS)
+        if write_header:
+            w.writeheader()
+        for r in new_rows:
+            w.writerow(_ensure_row_keys(r))
+    return len(new_rows)
 
 def _process_links_to_rows(links: Iterable[str]) -> List[Dict[str, str]]:
     results: List[Dict[str, str]] = []
-
     for idx, link in enumerate(links, start=1):
         print(f"\n[{idx}] Przetwarzam: {link}")
         try:
@@ -117,30 +150,53 @@ def _process_links_to_rows(links: Iterable[str]) -> List[Dict[str, str]]:
 
     return results
 
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--region", "-r", required=True,
+                    help="Slug województwa (np. mazowieckie) lub etykieta (np. Mazowieckie).")
+    args = ap.parse_args()
 
-def main():
-    intake = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else DEFAULT_INTAKE
-    db_path = Path(sys.argv[2]).expanduser() if len(sys.argv) > 2 else DB_XLSX
+    # normalizacja – przyjmujemy zarówno 'Mazowieckie' jak i 'mazowieckie'
+    reg = args.region.strip().lower()
+    # mapowanie uproszczone (akceptujemy też gotowy slug)
+    MAP = {
+        "dolnośląskie": "dolnoslaskie", "dolnoslaskie": "dolnoslaskie",
+        "kujawsko-pomorskie": "kujawsko-pomorskie",
+        "lubelskie": "lubelskie",
+        "lubuskie": "lubuskie",
+        "łódzkie": "lodzkie", "lodzkie": "lodzkie",
+        "małopolskie": "malopolskie", "malopolskie": "malopolskie",
+        "mazowieckie": "mazowieckie",
+        "opolskie": "opolskie",
+        "podkarpackie": "podkarpackie",
+        "podlaskie": "podlaskie",
+        "pomorskie": "pomorskie",
+        "śląskie": "slaskie", "slaskie": "slaskie",
+        "świętokrzyskie": "swietokrzyskie", "swietokrzyskie": "swietokrzyskie",
+        "warmińsko-mazurskie": "warminsko-mazurskie", "warminsko-mazurskie": "warminsko-mazurskie",
+        "wielkopolskie": "wielkopolskie",
+        "zachodniopomorskie": "zachodniopomorskie",
+    }
+    region_slug = MAP.get(reg, reg)
+    if region_slug not in MAP.values():
+        raise SystemExit(f"Nieznane województwo: {args.region}")
 
-    print(f"[INFO] Wejście: {intake}")
-    print(f"[INFO] Baza danych: {db_path} (arkusz: {DB_SHEET})")
+    intake = BASE_DIR / f"intake_{region_slug}.csv"
+    out_csv = BASE_DIR / f"wyniki_{region_slug}.csv"
+
+    print(f"[INFO] Wejście:  {intake.name}")
+    print(f"[INFO] Wyjście:  {out_csv.name}")
 
     links = _read_links_from_csv(intake)
     if not links:
         print("[INFO] Brak linków do przetworzenia.")
-        return
-
-    ensure_baza_mieszkania(db_path, sheet=DB_SHEET)
+        sys.exit(0)
 
     rows = _process_links_to_rows(links)
     if not rows:
         print("[INFO] Brak poprawnych rekordów do zapisania (np. brak cen).")
-        return
+        sys.exit(0)
 
-    append_mieszkania_rows(db_path, rows, sheet=DB_SHEET)
-    print(f"[OK] Zapisano {len(rows)} rekordów do „{db_path.name}” / arkusz „{DB_SHEET}”.")
+    added = _append_rows_to_csv(out_csv, rows)
+    print(f"[OK] Dopisano {added} nowych rekordów do „{out_csv.name}”.")
     print("Gotowe.")
-
-
-if __name__ == "__main__":
-    main()

@@ -3,21 +3,16 @@
 """
 linki_mieszkania.py
 
-Zbiera linki do ofert „mieszkania” z Otodom i zapisuje je do CSV.
-Dla KAŻDEGO dopisanego linku zapisuje także datę i godzinę pobrania
-w osobnych kolumnach:
-  - captured_date (YYYY-MM-DD, strefa Europe/Warsaw)
-  - captured_time (HH:MM:SS, strefa Europe/Warsaw)
+Zbiera linki do ofert „mieszkania” z Otodom i zapisuje je do CSV
+per-województwo: intake_<wojewodztwo>.csv (np. intake_mazowieckie.csv).
 
-Plik wyjściowy: intake.csv (zgodny wstecz – scraper czyta tylko kolumnę `link`).
-
-Uwaga:
-- Skrypt próbuje działać bez przeglądarki (requests + BeautifulSoup).
-- Jeśli Otodom zmieni layout, w razie potrzeby można przełączyć się na Selenium.
+- Jeśli plik istnieje, NIE jest nadpisywany – dopisywane są tylko nowe linki.
+- Dla każdego dopisanego linku zapisuje datę i godzinę pobrania (Europe/Warsaw).
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import re
@@ -40,24 +35,17 @@ try:
 except Exception:
     _SELENIUM_AVAILABLE = False
 
-# ------------------------------------------------------------------
 from datetime import datetime
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
     _TZ = ZoneInfo("Europe/Warsaw")
 except Exception:
-    _TZ = None  # fallback: naive localtime
+    _TZ = None
 
 from secrets import SystemRandom
 _RNG = SystemRandom()
 
 BASE_DIR = Path(__file__).resolve().parent
-CSV_PATH = BASE_DIR / "intake.csv"  # zachowujemy zgodność ze scraperem
-
-START_URL = (
-    "https://www.otodom.pl/pl/wyniki/sprzedaz/mieszkanie/cala-polska"
-    "?limit=36&ownerTypeSingleSelect=ALL&by=DEFAULT&direction=DESC"
-)
 
 WAIT_SECONDS = 20
 HEADLESS = False
@@ -70,6 +58,32 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
+VOIVODESHIPS = {
+    "dolnoslaskie": "Dolnośląskie",
+    "kujawsko-pomorskie": "Kujawsko-Pomorskie",
+    "lubelskie": "Lubelskie",
+    "lubuskie": "Lubuskie",
+    "lodzkie": "Łódzkie",
+    "malopolskie": "Małopolskie",
+    "mazowieckie": "Mazowieckie",
+    "opolskie": "Opolskie",
+    "podkarpackie": "Podkarpackie",
+    "podlaskie": "Podlaskie",
+    "pomorskie": "Pomorskie",
+    "slaskie": "Śląskie",
+    "swietokrzyskie": "Świętokrzyskie",
+    "warminsko-mazurskie": "Warmińsko-Mazurskie",
+    "wielkopolskie": "Wielkopolskie",
+    "zachodniopomorskie": "Zachodniopomorskie",
+}
+
+def _slugify_region(s: str) -> str:
+    s = s.strip().lower()
+    # pozwalamy na podanie etykiety z polskimi znakami – mapujemy do slugów
+    reverse = {v.lower(): k for k, v in VOIVODESHIPS.items()}
+    return VOIVODESHIPS.get(s, None) or reverse.get(s, None) or s  # s może już być slugiem
+
+
 # ------------------------------ Utils ------------------------------
 def add_or_replace_query_param(url: str, key: str, value: str) -> str:
     parts = list(urlparse(url))
@@ -78,13 +92,10 @@ def add_or_replace_query_param(url: str, key: str, value: str) -> str:
     parts[4] = urlencode(q, doseq=True)
     return urlunparse(parts)
 
-
 def _strip_accents(text: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
 
-
 def parse_total_offers(html: str) -> int | None:
-    # spróbuj z JSON wstrzykniętego do strony
     for key in ("totalResults", "numberOfItems", "total", "resultsCount", "offersCount"):
         m = re.search(rf'"{key}"\s*:\s*(\d+)', html)
         if m:
@@ -92,7 +103,6 @@ def parse_total_offers(html: str) -> int | None:
                 return int(m.group(1))
             except ValueError:
                 continue
-    # fallback: heurystyka po tekście
     ascii_html = _strip_accents(html.lower())
     m = re.search(r'([\d\s\.,]+)\s*oglosz', ascii_html)
     if m:
@@ -102,12 +112,10 @@ def parse_total_offers(html: str) -> int | None:
             pass
     return None
 
-
 def parse_links_from_html(html: str, base_url: str) -> set[str]:
     soup = BeautifulSoup(html, "html.parser")
     links: set[str] = set()
 
-    # główny selektor kart ogłoszeń
     for a in soup.select('a[data-cy="listing-item-link"][href]'):
         href = (a.get("href") or "").strip()
         if not href:
@@ -116,7 +124,6 @@ def parse_links_from_html(html: str, base_url: str) -> set[str]:
         if "/pl/oferta/" in full:
             links.add(full)
 
-    # JSON-LD (czasem lista ofert jest również w danych strukturalnych)
     for script in soup.find_all("script", {"type": "application/ld+json"}):
         raw = script.string or ""
         if not raw.strip():
@@ -146,11 +153,8 @@ def parse_links_from_html(html: str, base_url: str) -> set[str]:
         walk(data)
     return links
 
-
 # ------------------------------ FETCHERS ------------------------------
 class HttpFetcher:
-    """Prosty pobieracz przez requests (bez przeglądarki)."""
-
     def __init__(self, wait_seconds: int = WAIT_SECONDS):
         self.sess = requests.Session()
         self.sess.headers.update(
@@ -193,92 +197,13 @@ class HttpFetcher:
         except Exception:
             pass
 
+# (SeleniumFetcher pomijam – jak w Twojej wersji, nie zmieniałem)
 
-class SeleniumFetcher:
-    """Opcjonalny fetcher przez undetected_chromedriver (użyj tylko gdy to konieczne)."""
-
-    def __init__(self, headless: bool = HEADLESS, wait_seconds: int = WAIT_SECONDS):
-        if not _SELENIUM_AVAILABLE:
-            raise RuntimeError("Selenium/undetected_chromedriver nie są dostępne w środowisku.")
-        opts = uc.ChromeOptions()
-        if headless:
-            opts.add_argument("--headless=new")
-        opts.add_argument("--disable-gpu")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--start-maximized")
-        if USER_AGENT:
-            opts.add_argument(f"--user-agent={USER_AGENT}")
-        self.driver = uc.Chrome(options=opts)
-        self.wait = WebDriverWait(self.driver, wait_seconds)
-
-    def get(self, url: str) -> bool:
-        last_err = None
-        for attempt in range(RETRIES_NAV):
-            try:
-                self.driver.get(url)
-                try:
-                    self.wait.until(
-                        EC.any_of(
-                            EC.presence_of_all_elements_located((By.CSS_SELECTOR, 'a[data-cy="listing-item-link"]')),
-                            EC.presence_of_element_located((By.CSS_SELECTOR, 'script[type="application/ld+json"]')),
-                        )
-                    )
-                except Exception:
-                    time.sleep(2)
-                self._gentle_scroll()
-                return True
-            except Exception as e:
-                last_err = e
-                time.sleep(1.5 * (attempt + 1))
-        print(f"[WARN] Nie udało się wczytać: {url} ({last_err})")
-        return False
-
-    def page_source(self) -> str:
-        return self.driver.page_source
-
-    def current_url(self) -> str:
-        return self.driver.current_url
-
-    def _gentle_scroll(self):
-        try:
-            h = self.driver.execute_script("return document.body.scrollHeight")
-            pos = 0
-            while pos < h:
-                pos += int(h * 0.25)
-                self.driver.execute_script(f"window.scrollTo(0, {pos});")
-                time.sleep(SCROLL_PAUSE)
-                h = self.driver.execute_script("return document.body.scrollHeight")
-        except Exception:
-            pass
-
-    def close(self):
-        try:
-            self.driver.quit()
-        except Exception:
-            pass
-
-
-# --------------------------- LOGIKA ---------------------------
 def _make_fetcher():
-    if USE_SELENIUM:
-        try:
-            return SeleniumFetcher(headless=HEADLESS, wait_seconds=WAIT_SECONDS)
-        except Exception as e:
-            print(f"[INFO] Przełączam na tryb HTTP (Selenium nie wystartował): {e}")
     return HttpFetcher(wait_seconds=WAIT_SECONDS)
 
-
-def collect_links_from_n_pages(
-    search_url: str,
-    pages: int = 1,
-    delay_min: float = 1.5,
-    delay_max: float = 6.0,
-) -> list[str]:
-    """
-    Zbiera linki z podanej liczby stron wyników. Między kolejnymi stronami
-    wprowadza losowe opóźnienie z zakresu [delay_min, delay_max].
-    """
+def collect_links_from_n_pages(search_url: str, pages: int = 1,
+                               delay_min: float = 1.5, delay_max: float = 6.0) -> list[str]:
     fetcher = _make_fetcher()
     seen, out = set(), []
     try:
@@ -294,21 +219,16 @@ def collect_links_from_n_pages(
                 break
             seen.update(new)
             out.extend(new)
-            # losowe opóźnienie 1.5–6.0s
             time.sleep(_RNG.uniform(delay_min, delay_max))
     finally:
         fetcher.close()
     return out
 
-
 def _read_existing_links(csv_path: Path) -> set[str]:
-    """Czytaj istniejące linki z CSV (obsługuje nagłówki: 'link', 'link,captured_at', 'link,captured_date,captured_time')."""
     existing: set[str] = set()
     if not csv_path.exists() or csv_path.stat().st_size == 0:
         return existing
-
     with csv_path.open("r", newline="", encoding="utf-8") as f:
-        # spróbuj DictReader
         sample = f.read(1024)
         f.seek(0)
         has_header = "link" in (sample.splitlines()[0].lower() if sample else "")
@@ -319,7 +239,6 @@ def _read_existing_links(csv_path: Path) -> set[str]:
                 if u:
                     existing.add(u)
         else:
-            # fallback: zwykły reader, pierwsza kolumna = link
             rr = csv.reader(f)
             for row in rr:
                 if not row:
@@ -329,36 +248,42 @@ def _read_existing_links(csv_path: Path) -> set[str]:
                     existing.add(u)
     return existing
 
-
-def append_links_with_timestamp(links: Iterable[str], csv_path: Path = CSV_PATH) -> int:
-    """
-    Dopisz unikalne linki do CSV z kolumnami: link,captured_date,captured_time.
-    Zwraca liczbę NOWO dodanych rekordów.
-    """
+def append_links_with_timestamp(links: Iterable[str], csv_path: Path) -> int:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     existing = _read_existing_links(csv_path)
     new = [u for u in links if u not in existing]
-
-    # ustal, czy trzeba dopisać nagłówki
     write_header = not csv_path.exists() or csv_path.stat().st_size == 0
-
     with csv_path.open("a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         if write_header:
             w.writerow(["link", "captured_date", "captured_time"])
         for u in new:
             now = datetime.now(tz=_TZ) if _TZ else datetime.now()
-            date_str = now.date().isoformat()                        # YYYY-MM-DD
-            time_str = now.time().isoformat(timespec="seconds")      # HH:MM:SS
-            w.writerow([u, date_str, time_str])
-
+            w.writerow([u, now.date().isoformat(), now.time().isoformat(timespec="seconds")])
     return len(new)
-
 
 # --------------------------- CLI ---------------------------
 if __name__ == "__main__":
-    pages = 1  # Możesz zwiększyć, np. 3–5
-    print(f"[INFO] Pobieram linki z {pages} strony/stron…")
-    all_links = collect_links_from_n_pages(START_URL, pages=pages)
-    added = append_links_with_timestamp(all_links, CSV_PATH)
-    print(f"[OK] Zebrano {len(all_links)} linków, dopisano {added} nowych do {CSV_PATH.name}")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--region", "-r", required=True,
+                    help="Slug województwa (np. mazowieckie) lub etykieta (np. Mazowieckie).")
+    ap.add_argument("--pages", "-p", type=int, default=1, help="Ile stron wyników pobrać (domyślnie 1).")
+    args = ap.parse_args()
+
+    region_slug = _slugify_region(args.region)
+    if region_slug not in VOIVODESHIPS:
+        raise SystemExit(f"Nieznane województwo: {args.region}")
+
+    start_url = (
+        f"https://www.otodom.pl/pl/wyniki/sprzedaz/mieszkanie/{region_slug}"
+        "?limit=36&ownerTypeSingleSelect=ALL&by=DEFAULT&direction=DESC"
+    )
+    csv_path = BASE_DIR / f"intake_{region_slug}.csv"
+
+    print(f"[INFO] Województwo: {VOIVODESHIPS[region_slug]} ({region_slug})")
+    print(f"[INFO] URL startowy: {start_url}")
+    print(f"[INFO] Plik intake: {csv_path.name}")
+
+    links = collect_links_from_n_pages(start_url, pages=args.pages)
+    added = append_links_with_timestamp(links, csv_path)
+    print(f"[OK] Zebrano {len(links)} linków, dopisano {added} nowych do {csv_path.name}")

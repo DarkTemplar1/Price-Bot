@@ -22,7 +22,7 @@ import pandas as pd
 
 SHEET_RAPORT = "raport"
 SHEET_ODF = "raport_odfiltrowane"
-COL_UDZ = "Czy udziały ?"
+COL_UDZ = "Czy udziały?"
 COL_PRZ = "Przeznaczenie (dla lokalu)"
 
 def _norm(s: str) -> str:

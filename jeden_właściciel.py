@@ -19,7 +19,7 @@ import pandas as pd
 
 SHEET_RAPORT = "raport"
 SHEET_ODF = "raport_odfiltrowane"
-COL_UDZ = "Czy udziały ?"
+COL_UDZ = "Czy udziały?"
 
 def _load_or_first(xlsx: Path) -> str:
     xl = pd.ExcelFile(xlsx, engine="openpyxl")
