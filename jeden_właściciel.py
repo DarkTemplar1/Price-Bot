@@ -1,16 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-jeden_właściciel.py
-
-• Z ARKUSZA „raport” przerzuca do „raport_odfiltrowane” te wiersze,
-  w których kolumna „Czy udziały ?” NIE zawiera słowa „nie”.
-• Arkusz „raport” zapisuje bez tych rekordów (bez dziur).
-• „raport_odfiltrowane”: dopisuje (append) rekordy – zachowuje nagłówek w wierszu 1.
-
-Użycie:
-  python jeden_właściciel.py --in <plik.xlsx>
-"""
 from __future__ import annotations
 
 import sys

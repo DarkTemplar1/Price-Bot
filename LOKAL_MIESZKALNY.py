@@ -1,18 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-LOKAL_MIESZKALNY.py
-
-• Z arkusza „raport” przerzuca do „raport_odfiltrowane” wiersze, w których
-  kolumna „Przeznaczenie (dla lokalu)” NIE równa się „LOKAL MIESZKALNY”.
-• Arkusz „raport” zapisuje bez tych rekordów (bez dziur).
-• „raport_odfiltrowane” – dopisuje (append).
-
-Użycie:
-  python LOKAL_MIESZKALNY.py --in <plik.xlsx>
-"""
 from __future__ import annotations
-
 import sys
 from pathlib import Path
 import pandas as pd

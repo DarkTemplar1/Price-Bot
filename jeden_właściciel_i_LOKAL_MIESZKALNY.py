@@ -1,20 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-jeden_właściciel_i_LOKAL_MIESZKALNY.py
-
-• Z arkusza „raport” przerzuca do „raport_odfiltrowane” wszystkie wiersze,
-  które NIE spełniają JEDNOCZEŚNIE:
-     - „Czy udziały ?” zawiera słowo „nie”   ORAZ
-     - „Przeznaczenie (dla lokalu)” == „LOKAL MIESZKALNY”
-• Reszta zostaje w „raport” (zapisana bez dziur).
-• Do „raport_odfiltrowane” dopisuje (append).
-
-Użycie:
-  python jeden_właściciel_i_LOKAL_MIESZKALNY.py --in <plik.xlsx>
-"""
 from __future__ import annotations
-
 import sys
 from pathlib import Path
 import re, unicodedata

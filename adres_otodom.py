@@ -1,25 +1,7 @@
 from __future__ import annotations
-"""
-adres_otodom.py — wersja BEZ zależności od SOAP/zeep
-
-Co zostało:
-- Te same funkcje publiczne jak wcześniej, aby scraper działał bez zmian:
-  set_contact_email, set_teryt_credentials (no-op), parsuj_adres_string,
-  uzupelnij_braki_z_nominatim, dopelnij_powiat_gmina_jesli_brak,
-  _clean_gmina, _tylko_dzielnica, _consistency_pass_row.
-
-Co się zmieniło:
-- Usunięto import i użycie biblioteki 'zeep' (SOAP TERYT).
-- „Uzupełnianie” odbywa się lokalnie (heurystyki):
-    • Województwo – z mapy znanych miast (VOIVODESHIP_BY_CITY).
-    • Miasta na prawach powiatu – ustaw powiat i gminę = miasto.
-    • Porządki nazw (prefiksy „woj./powiat/gmina”, wielkość liter, itp.).
-- Funkcja set_teryt_credentials istnieje, ale nic nie robi (dla kompatybilności).
-"""
-
 import dataclasses
 import re
-from typing import Any, Dict, Optional
+from typing import Optional
 
 # ================== KONFIG / STAŁE ==================
 CONTACT_EMAIL = "twoj_email@domena.pl"  # można nadpisać przez set_contact_email()

@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
-"""
-dalej.py — panel „Operacje plikowe”
-
-Przyciski:
-- „⟵ Wróć”         → zamyka to okno i uruchamia main.py
-- „Baza danych”     → zamyka to okno i uruchamia bazadanych.py (fallback: bazydanych.py)
-- „Wynik”           → zamyka to okno i uruchamia wyniki.py (fallback: wynik.py)
-
-Jeśli do dalej.py przekazano ścieżkę do pliku Excela jako pierwszy argument,
-to jest ona wyświetlana i przekazywana dalej do uruchamianych skryptów.
-"""
-
 import sys
 import subprocess
 from pathlib import Path

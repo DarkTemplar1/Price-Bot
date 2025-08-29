@@ -1,23 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-sortownia.py — launcher filtrów
 
-Zmiany:
-• Lista (Combobox) z 3 opcjami i przycisk „Aktywuj filtr”.
-• DODANE: przyciski „poprawa_adresu” (uruchamia popraw_adres.py) oraz „cofnij filtry” (uruchamia cofnij.py).
-• Do skryptów przekazywana jest ścieżka pliku Excel jako:  --in <ścieżka>.
-
-Mapowanie:
-    - „jeden właściciel” → jeden_właściciel.py
-    - „lokal mieszkalny” → LOKAL_MIESZKALNY.py
-    - „Jeden właściciel i Lokal mieszkalny” → jeden_właściciel_i_LOKAL_MIESZKALNY.py
-    - „poprawa_adresu” (guzik) → popraw_adres.py
-    - „cofnij filtry” (guzik) → cofnij.py
-"""
 
 from __future__ import annotations
-
 import sys
 import subprocess
 from pathlib import Path

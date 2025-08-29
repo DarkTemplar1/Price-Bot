@@ -1,29 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-linki_mieszkania.py
-
-Zbiera linki do ofert „mieszkania” z Otodom i zapisuje je do CSV
-per-województwo: intake_<wojewodztwo>.csv (np. intake_mazowieckie.csv).
-
-- Domyślnie działa dla WSZYSTKICH województw (-r/--region all).
-- Automatycznie przechodzi przez WSZYSTKIE dostępne strony wyników.
-- Jeżeli plik istnieje, dopisuje tylko nowe linki (bez duplikatów).
-- Dla każdego dopisanego linku zapisuje datę i godzinę pobrania (Europe/Warsaw).
-"""
-
 from __future__ import annotations
-
 import argparse
 import csv
 import json
-import re
 import time
 import unicodedata
 from pathlib import Path
 from typing import Iterable, List
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
-
 import requests
 from bs4 import BeautifulSoup
 

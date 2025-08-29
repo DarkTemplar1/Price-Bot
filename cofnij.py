@@ -1,22 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-cofnij.py
-
-Przenosi (cofa) wiersze z arkusza „raport_odfiltrowane” do arkusza RAPORT,
-doklejając je pod ostatnim wypełnionym wierszem. Po przeniesieniu domyślnie
-czyści dane z „raport_odfiltrowane”.
-
-Użycie:
-    python cofnij.py --in PLik.xlsx
-    python cofnij.py --in PLik.xlsx --sheet "Mój RAPORT"
-    python cofnij.py --in PLik.xlsx --source "raport_odfiltrowane" --no-clear
-"""
-
 from pathlib import Path
 import argparse
 from typing import List, Dict
-
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 

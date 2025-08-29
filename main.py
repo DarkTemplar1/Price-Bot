@@ -1,19 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-main.py
-
-Okno startowe → wybór pliku Excel → Panel pliku z przyciskami:
-- „sortowanie danych”  → uruchamia sortownia.py (modalnie) na wybranym pliku
-- „operacje plikowe”   → uruchamia dalej.py, przekazując ścieżkę (i czyści robocze CSV)
-- „Wybierz inny plik”  → zmienia wskazany plik w panelu
-
-Poprawki:
-- naprawiono literówkę po grid() (zbędne "a" powodowało błąd uruchomienia),
-- wybór pliku działa poprawnie, a ścieżka jest przekazywana do sortowni/dalej,
-- okna dialogowe mają ustawionego parenta, żeby były modalne względem bieżącego okna.
-"""
-
 import sys
 import subprocess
 from importlib.util import spec_from_file_location, module_from_spec
