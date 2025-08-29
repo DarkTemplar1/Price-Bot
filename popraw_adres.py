@@ -1,312 +1,233 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-popraw_adres.py — automatyczna korekta pól adresowych w Excelu (z podsumowaniem w GUI)
-
-Działanie:
-- Przechodzi po arkuszach: „raport” oraz „raport_odfiltrowane” (jeśli istnieją).
-  Jeżeli „raport” nie istnieje — używa pierwszego arkusza.
-- Upewnia się, że istnieją kolumny: Województwo, Powiat, Gmina, Miejscowość, Dzielnica.
-- Dla każdego wiersza:
-    • czyści prefiksy (woj./powiat/gmina/dzielnica) i białe znaki,
-    • próbuje kanonizować/uzupełnić pola przez TERYT (moduł `adres_otodom`),
-    • w razie braku TERYT — heurystyki + lista 16 województw.
-- Zapisuje poprawione arkusze (replace).
-- Na koniec pokazuje okienko z podsumowaniem zmian.
-
-Użycie:
-    python popraw_adres.py --in <plik.xlsx>
-    # opcjonalnie:
-    python popraw_adres.py --in <plik.xlsx> --sheets raport,raport_odfiltrowane
-"""
-
-from __future__ import annotations
-
-import sys
-import re
-import argparse
-import unicodedata
 from pathlib import Path
-from typing import Dict, Optional, Tuple, List
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from openpyxl import load_workbook
 
-import pandas as pd
+RAPORT_SHEET = "raport"
+RAPORT_ODF = "raport_odfiltrowane"
 
-# ======= Opcjonalny TERYT (adres_otodom) =======
-_HAS_TERYT = False
-try:
-    from adres_otodom import (
-        TerytClient,
-        uzupelnij_braki_z_teryt,
-        dopelnij_powiat_gmina_jesli_brak,
-        _clean_gmina as _clean_gm_name,
-    )
-    _HAS_TERYT = True
-except Exception:
-    def _clean_gm_name(x):  # type: ignore
-        return x
-
-VOIVODESHIPS = [
-    "Dolnośląskie","Kujawsko-Pomorskie","Lubelskie","Lubuskie","Łódzkie","Małopolskie",
-    "Mazowieckie","Opolskie","Podkarpackie","Podlaskie","Pomorskie","Śląskie",
-    "Świętokrzyskie","Warmińsko-Mazurskie","Wielkopolskie","Zachodniopomorskie",
+REQ_COLS = [
+    "Nr KW", "Typ Księgi", "Stan Księgi", "Województwo", "Powiat", "Gmina",
+    "Miejscowość", "Dzielnica", "Położenie", "Nr działek po średniku", "Obręb po średniku",
+    "Ulica", "Sposób korzystania", "Obszar", "Ulica(dla budynku)",
+    "przeznaczenie (dla budynku)", "Ulica(dla lokalu)", "Nr budynku( dla lokalu)",
+    "Przeznaczenie (dla lokalu)", "Cały adres (dla lokalu)",
+    "Czy udziały?"
 ]
-VOIV_K2CANON = {}  # wypełnimy po zdefiniowaniu normalizatora
+
+EXTRA_VAL_COLS = [
+    "Średnia cena za m2 ( z bazy)",
+    "Średnia skorygowana cena za m2",
+    "Statyczna wartość nieruchomości"
+]
 
 ADDR_COLS = ["Województwo", "Powiat", "Gmina", "Miejscowość", "Dzielnica"]
-SHEET_RAPORT = "raport"
-SHEET_ODF = "raport_odfiltrowane"
+
+OLD_TO_NEW_VOIV = {
+    "białostockie": "podlaskie", "bielskie": "śląskie", "bydgoskie": "kujawsko-pomorskie",
+    "chełmskie": "lubelskie", "ciechanowskie": "mazowieckie", "częstochowskie": "śląskie",
+    "elbląskie": "warmińsko-mazurskie", "gdańskie": "pomorskie", "gorzowskie": "lubuskie",
+    "jeleniogórskie": "dolnośląskie", "kaliskie": "wielkopolskie", "katowickie": "śląskie",
+    "kieleckie": "świętokrzyskie", "koszalińskie": "zachodniopomorskie", "krakowskie": "małopolskie",
+    "krośnieńskie": "podkarpackie", "legnickie": "dolnośląskie", "leszczyńskie": "wielkopolskie",
+    "łomżyńskie": "podlaskie", "nowosądeckie": "małopolskie", "olsztyńskie": "warmińsko-mazurskie",
+    "opole": "opolskie", "ostrołęckie": "mazowieckie", "piotrkowskie": "łódzkie",
+    "płockie": "mazowieckie", "poznańskie": "wielkopolskie", "przemyskie": "podkarpackie",
+    "radomskie": "mazowieckie", "rzeszowskie": "podkarpackie", "siedleckie": "mazowieckie",
+    "sieradzkie": "łódzkie", "skierniewickie": "łódzkie", "słupskie": "pomorskie",
+    "suwałskie": "podlaskie", "szczecińskie": "zachodniopomorskie", "tarnobrzeskie": "podkarpackie",
+    "tarnowskie": "małopolskie", "toruńskie": "kujawsko-pomorskie", "wałbrzyskie": "dolnośląskie",
+    "warszawskie": "mazowieckie", "włocławskie": "kujawsko-pomorskie", "wrocławskie": "dolnośląskie",
+    "zamojsko-chełmskie": "lubelskie", "zielonogórskie": "lubuskie"
+}
+
+CITY_TO_VOIV = {
+    "warszawa": "mazowieckie", "kraków": "małopolskie", "łódź": "łódzkie", "wrocław": "dolnośląskie",
+    "poznań": "wielkopolskie", "gdańsk": "pomorskie", "szczecin": "zachodniopomorskie",
+    "katowice": "śląskie", "lublin": "lubelskie", "białystok": "podlaskie",
+    "rzeszów": "podkarpackie", "kielce": "świętokrzyskie", "olsztyn": "warmińsko-mazurskie",
+    "opole": "opolskie", "toruń": "kujawsko-pomorskie", "bydgoszcz": "kujawsko-pomorskie",
+    "gorzów wielkopolski": "lubuskie", "zielona góra": "lubuskie"
+}
 
 
-# ======= Normalizacja tekstu / prefiksów =======
-def _strip_accents(s: str) -> str:
-    return "".join(ch for ch in unicodedata.normalize("NFD", s) if unicodedata.category(ch) != "Mn")
-
-def _norm_key(s: str) -> str:
-    return re.sub(r"\s+", " ", _strip_accents(str(s or "")).strip().lower())
-
-VOIV_K2CANON = {_norm_key(v): v for v in VOIVODESHIPS}
-
-def _title_pl(s: str) -> str:
-    s = str(s or "").strip()
-    if not s:
-        return s
-    return s[:1].upper() + s[1:].lower()
-
-def _clean_prefixes(txt: str, level: str) -> str:
-    t = str(txt or "")
-    t = re.sub(r"\s+", " ", t).strip()
-    if not t:
-        return t
-    if level == "woj":
-        t = re.sub(r"^(woj\.?|wojewodztwo|województwo)\s*", "", t, flags=re.I)
-    elif level == "pow":
-        t = re.sub(r"^(powiat|pow\.)\s*", "", t, flags=re.I)
-    elif level == "gm":
-        t = re.sub(r"^(gmina|gm\.)\s*(miejska|wiejska|miejsko-wiejska)?\s*", "", t, flags=re.I)
-    elif level == "dz":
-        t = re.sub(r"^(dzielnica|dz\.)\s*", "", t, flags=re.I)
-    return t.strip()
-
-def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    for c in ADDR_COLS:
-        if c not in df.columns:
-            df[c] = ""
-    return df
+def get_header_map(ws):
+    headers = {}
+    for idx, cell in enumerate(ws[1], start=1):
+        if cell.value:
+            headers[str(cell.value).strip()] = idx
+    return headers
 
 
-# ======= Fallback (bez TERYT) =======
-def _canon_woj_fallback(txt: str) -> Tuple[str, bool]:
-    raw = _clean_prefixes(txt, "woj")
-    key = _norm_key(raw)
-    if not key:
-        return "", False
-    if key in VOIV_K2CANON:
-        return VOIV_K2CANON[key], True
-    ALIASES = {
-        "slaskie": "Śląskie",
-        "lodzkie": "Łódzkie",
-        "malopolskie": "Małopolskie",
-        "mazowieckie": "Mazowieckie",
-        "wielkopolskie": "Wielkopolskie",
-        "zachodniopomorskie": "Zachodniopomorskie",
-        "kujawsko pomorskie": "Kujawsko-Pomorskie",
-        "warminsko mazurskie": "Warmińsko-Mazurskie",
-        "swietokrzyskie": "Świętokrzyskie",
-    }
-    if key in ALIASES:
-        return ALIASES[key], True
-    return _title_pl(raw), False
+def normalize(s):
+    return "" if s is None else str(s).strip()
 
 
-# ======= Korekta jednego wiersza =======
-def _fix_row_with_teryt(row: pd.Series, klient: Optional["TerytClient"]) -> Dict[str, str]:
-    woj = _clean_prefixes(row.get("Województwo", ""), "woj")
-    powiat = _clean_prefixes(row.get("Powiat", ""), "pow")
-    gmina = _clean_prefixes(row.get("Gmina", ""), "gm")
-    msc = _clean_prefixes(row.get("Miejscowość", ""), "")
-    dz = _clean_prefixes(row.get("Dzielnica", ""), "dz")
+def choose_file(title, patterns):
+    root = tk.Tk();
+    root.withdraw()
+    f = filedialog.askopenfilename(title=title, filetypes=[("Excel", "*.xlsx")])
+    root.destroy()
+    return f
 
-    out = {
-        "Województwo": woj,
-        "Powiat": powiat,
-        "Gmina": gmina,
-        "Miejscowość": msc,
-        "Dzielnica": dz,
-    }
 
-    if not _HAS_TERYT or klient is None:
-        woj_c, _ = _canon_woj_fallback(woj)
-        out["Województwo"] = woj_c
-        out["Powiat"] = _title_pl(powiat)
-        out["Gmina"] = _title_pl(_clean_gm_name(gmina))
-        out["Miejscowość"] = _title_pl(msc)
-        out["Dzielnica"] = _title_pl(dz)
-        return out
+def load_teryt(teryt_path):
+    wb = load_workbook(teryt_path, data_only=True)
+    ws = wb.active
+    h = get_header_map(ws)
+    required = ["Województwo", "Powiat", "Gmina", "Miejscowość", "Dzielnica"]
+    for r in required:
+        if r not in h:
+            raise RuntimeError("Plik TERYT.xlsx musi mieć kolumny: " + ", ".join(required))
+    data = []
+    for r in range(2, ws.max_row + 1):
+        row = {k: normalize(ws.cell(row=r, column=h[k]).value) for k in required}
+        data.append(row)
+    return data
 
-    ad = {
-        "ulica_nazwa": None,
-        "nr": None,
-        "miasto": msc or dz,
-        "dzielnica": dz,
-        "wojewodztwo": woj,
-        "gmina": gmina,
-        "powiat": powiat,
-        "oryginal": "",
-    }
 
-    try:
-        ad2 = uzupelnij_braki_z_teryt(ad, klient=klient)
-        ad3 = dopelnij_powiat_gmina_jesli_brak(ad2, klient=klient)
-    except Exception:
-        woj_c, _ = _canon_woj_fallback(woj)
-        out["Województwo"] = woj_c
-        out["Powiat"] = _title_pl(powiat)
-        out["Gmina"] = _title_pl(_clean_gm_name(gmina))
-        out["Miejscowość"] = _title_pl(msc)
-        out["Dzielnica"] = _title_pl(dz)
-        return out
+def load_kw_map(kw_map_path):
+    wb = load_workbook(kw_map_path, data_only=True)
+    ws = wb.active
+    h = get_header_map(ws)
+    if "KW_PREFIX" not in h:
+        raise RuntimeError("Plik KW_prefix_map.xlsx musi zawierać kolumnę 'KW_PREFIX'")
+    cols = ["Województwo", "Powiat", "Gmina", "Miejscowość"]
+    data = {}
+    for r in range(2, ws.max_row + 1):
+        pref = normalize(ws.cell(row=r, column=h["KW_PREFIX"]).value).upper()
+        if not pref:
+            continue
+        rec = {}
+        for c in cols:
+            if c in h:
+                rec[c] = normalize(ws.cell(row=r, column=h[c]).value)
+        data[pref] = rec
+    return data
 
-    woj_fin, _ = _canon_woj_fallback(ad3.get("wojewodztwo") or woj)
-    out["Województwo"] = woj_fin
-    out["Powiat"] = _title_pl(ad3.get("powiat") or powiat)
-    out["Gmina"] = _title_pl(_clean_gm_name(ad3.get("gmina") or gmina))
-    out["Miejscowość"] = _title_pl(ad3.get("miasto") or msc)
-    out["Dzielnica"] = _title_pl(ad3.get("dzielnica") or dz)
+
+def intersect_candidates(cands, kw_rec):
+    if not kw_rec:
+        return cands
+    out = []
+    for c in cands:
+        ok = True
+        for k, v in kw_rec.items():
+            if v and c.get(k, "") and c.get(k, "").lower() != v.lower():
+                ok = False;
+                break
+        if ok:
+            out.append(c)
     return out
 
 
-def _normalize_df(df: pd.DataFrame, klient: Optional["TerytClient"]) -> pd.DataFrame:
-    df = _ensure_columns(df)
-    if df.empty:
-        return df
-    fixed = []
-    for _, row in df.iterrows():
-        fixed.append(_fix_row_with_teryt(row, klient))
-    res = df.copy()
-    for c in ADDR_COLS:
-        res[c] = [r[c] for r in fixed]
-    return res
+def fill_from_candidates(ws, r, hmap, candidates):
+    stable = {}
+    keys = ["Województwo", "Powiat", "Gmina", "Miejscowość", "Dzielnica"]
+    for k in keys:
+        vals = {c.get(k, "").lower() for c in candidates if c.get(k)}
+        if len(vals) == 1:
+            stable[k] = next(iter(vals))
+    for k, v in stable.items():
+        if not normalize(ws.cell(row=r, column=hmap[k]).value):
+            ws.cell(row=r, column=hmap[k], value=v)
 
 
-def _count_addr_changes(df_before: pd.DataFrame, df_after: pd.DataFrame) -> int:
-    """Policz, w ilu wierszach cokolwiek zmieniło się w adresowych kolumnach."""
-    cols = [c for c in ADDR_COLS if c in df_before.columns and c in df_after.columns]
-    if not cols or len(df_before) != len(df_after):
-        return 0
-    a = df_before[cols].fillna("").astype(str)
-    b = df_after[cols].fillna("").astype(str)
-    return int((a != b).any(axis=1).sum())
-
-
-# ======= I/O arkuszy =======
-def _pick_sheets(xlsx: Path, explicit: Optional[List[str]]) -> List[str]:
-    try:
-        xl = pd.ExcelFile(xlsx, engine="openpyxl")
-    except Exception as e:
-        print(f"[ERR] Nie można otworzyć Excela: {e}")
-        sys.exit(2)
-
-    names = xl.sheet_names
-    if explicit:
-        return [s for s in explicit if s in names]
-
-    out = []
-    if SHEET_RAPORT in names:
-        out.append(SHEET_RAPORT)
-    else:
-        out.append(names[0])
-    if SHEET_ODF in names:
-        out.append(SHEET_ODF)
-    # unikatowo
-    seen, uniq = set(), []
-    for s in out:
-        if s not in seen:
-            uniq.append(s); seen.add(s)
-    return uniq
-
-
-def _show_summary_gui(message: str):
-    """Pokaż krótkie okno z podsumowaniem. Jeśli Tkinter niedostępny — pomiń."""
-    try:
-        import tkinter as tk
-        from tkinter import messagebox
-    except Exception:
+def popraw():
+    root = tk.Tk();
+    root.withdraw()
+    path = filedialog.askopenfilename(title="Wybierz raport (.xlsx)", filetypes=[("Excel", "*.xlsx")])
+    root.destroy()
+    if not path:
         return
-    try:
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        messagebox.showinfo("Poprawa adresów — zakończono", message, parent=root)
-        root.destroy()
-    except Exception:
-        pass
 
+    wb = load_workbook(path)
+    if RAPORT_SHEET not in wb.sheetnames:
+        messagebox.showerror("Błąd", f"Brak arkusza '{RAPORT_SHEET}'")
+        return
+    ws = wb[RAPORT_SHEET]
+    hmap = get_header_map(ws)
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(description="Automatyczna korekta pól adresowych (TERYT jeśli dostępny).")
-    ap.add_argument("--in", dest="path", required=True, help="Ścieżka do pliku Excel")
-    ap.add_argument("--sheets", dest="sheets", default=None,
-                    help="Lista arkuszy po przecinku (np. raport,raport_odfiltrowane)")
-    args = ap.parse_args(argv)
+    for needed in ADDR_COLS + EXTRA_VAL_COLS + ["Nr KW"]:
+        if needed not in hmap:
+            messagebox.showerror("Błąd", f"Brak wymaganej kolumny: {needed}")
+            return
 
-    xlsx = Path(args.path).expanduser()
-    if not xlsx.exists():
-        print(f"[ERR] Brak pliku: {xlsx}")
-        sys.exit(1)
+    teryt_path = None
+    kw_map_path = None
+    if Path("TERYT.xlsx").exists():
+        teryt_path = "TERYT.xlsx"
+    if Path("KW_prefix_map.xlsx").exists():
+        kw_map_path = "KW_prefix_map.xlsx"
 
-    sheets = _pick_sheets(xlsx, [s.strip() for s in args.sheets.split(",")] if args.sheets else None)
+    if not teryt_path:
+        teryt_path = choose_file("Wskaż TERYT.xlsx (Województwo,Powiat,Gmina,Miejscowość,Dzielnica)",
+                                 ["*.xlsx"]) or None
+    if not kw_map_path:
+        kw_map_path = choose_file("Wskaż KW_prefix_map.xlsx (KW_PREFIX, ...)", ["*.xlsx"]) or None
 
-    # TERYT klient (opcjonalnie)
-    klient = None
-    mode = "TERYT"
-    if _HAS_TERYT:
+    teryt_data = []
+    kw_map = {}
+    if teryt_path and Path(teryt_path).exists():
         try:
-            klient = TerytClient()
+            teryt_data = load_teryt(teryt_path)
         except Exception as e:
-            print(f"[WARN] TERYT niedostępny ({e}) – używam trybu fallback.")
-            klient = None
-            mode = "fallback"
-    else:
-        mode = "fallback"
-
-    updated = 0
-    changed_rows_total = 0
-    per_sheet_info: List[str] = []
-
-    for sh in sheets:
+            messagebox.showwarning("TERYT", f"Nie udało się załadować TERYT: {e}")
+    if kw_map_path and Path(kw_map_path).exists():
         try:
-            df_before = pd.read_excel(xlsx, sheet_name=sh, engine="openpyxl")
-        except Exception:
-            print(f"[INFO] Pomijam arkusz „{sh}” – nie można wczytać.")
+            kw_map = load_kw_map(kw_map_path)
+        except Exception as e:
+            messagebox.showwarning("KW map", f"Nie udało się załadować mapy KW: {e}")
+
+    idxs = [hmap[c] for c in ADDR_COLS]
+    idx_kw = hmap["Nr KW"]
+    idx_avg, idx_corr, idx_static = [hmap[c] for c in EXTRA_VAL_COLS]
+
+    for r in range(2, ws.max_row + 1):
+        cells = [normalize(ws.cell(row=r, column=i).value) for i in idxs]
+        if all(c == "" for c in cells):
+            ws.cell(row=r, column=idx_avg, value="Brak adresu")
+            ws.cell(row=r, column=idx_corr, value="Brak adresu")
+            ws.cell(row=r, column=idx_static, value="Brak adresu")
+
+    woj_idx = hmap["Województwo"]
+    for r in range(2, ws.max_row + 1):
+        v = normalize(ws.cell(row=r, column=woj_idx).value).lower()
+        if v in OLD_TO_NEW_VOIV:
+            ws.cell(row=r, column=woj_idx, value=OLD_TO_NEW_VOIV[v])
+
+    for r in range(2, ws.max_row + 1):
+        values = {c: normalize(ws.cell(row=r, column=hmap[c]).value) for c in ADDR_COLS}
+        if all(values[c] for c in ADDR_COLS):
             continue
 
-        df_after = _normalize_df(df_before, klient)
-        rows_changed = _count_addr_changes(df_before, df_after)
+        kw = normalize(ws.cell(row=r, column=idx_kw).value).upper()
+        kw_pref = "".join([ch for ch in kw if ch.isalnum()])[:4] if kw else ""
+        kw_rec = kw_map.get(kw_pref, {}) if kw_pref else {}
 
-        if not df_after.equals(df_before):
-            with pd.ExcelWriter(xlsx, engine="openpyxl", mode="a", if_sheet_exists="replace") as wr:
-                df_after.to_excel(wr, sheet_name=sh, index=False)
-            updated += 1
-            changed_rows_total += rows_changed
-            per_sheet_info.append(f"• {sh}: zmienione wiersze (adres) = {rows_changed}")
-            print(f"[OK] Zaktualizowano arkusz „{sh}” ({rows_changed} wierszy z modyfikacją adresu).")
-        else:
-            per_sheet_info.append(f"• {sh}: bez zmian")
-            print(f"[OK] Arkusz „{sh}” bez zmian.")
+        if values.get("Miejscowość") and not values.get("Województwo"):
+            mv = values["Miejscowość"].lower()
+            if mv in CITY_TO_VOIV:
+                ws.cell(row=r, column=hmap["Województwo"], value=CITY_TO_VOIV[mv])
+                values["Województwo"] = CITY_TO_VOIV[mv]
 
-    summary = (
-        f"Plik: {xlsx.name}\n"
-        f"Tryb: {mode}\n"
-        f"Zmienione arkusze: {updated}/{len(sheets)}\n"
-        f"Suma zmienionych wierszy (adres): {changed_rows_total}\n\n"
-        + "\n".join(per_sheet_info)
-    )
-    print("\n" + summary)
+        if teryt_data:
+            cands = teryt_data
+            for key in ADDR_COLS:
+                if values.get(key):
+                    cands = [x for x in cands if x.get(key, "").lower() == values[key].lower()]
+            cands = intersect_candidates(cands, kw_rec)
+            if len(cands) == 1:
+                row = cands[0]
+                for k in ADDR_COLS:
+                    if not values.get(k):
+                        ws.cell(row=r, column=hmap[k], value=row.get(k))
+            elif len(cands) > 1:
+                fill_from_candidates(ws, r, hmap, cands)
 
-    # Pokaż podsumowanie w GUI
-    _show_summary_gui(summary)
+    wb.save(path)
+    messagebox.showinfo("Zakończono", "Adresy zostały poprawione.")
 
 
 if __name__ == "__main__":
-    main()
+    popraw()
