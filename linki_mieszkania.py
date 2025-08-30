@@ -4,10 +4,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import time
 import unicodedata
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 import requests
 from bs4 import BeautifulSoup
@@ -65,7 +66,7 @@ VOIVODESHIPS_ORDERED: List[tuple[str, str]] = [
 VOIVODESHIPS = dict(VOIVODESHIPS_ORDERED)
 DEFAULT_REGION = "all"  # <- teraz domyślnie wszystkie
 
-
+# ------------------------------ Utils ------------------------------
 def _slugify_region_input(raw: str) -> List[str]:
     """
     Przyjmuje:
@@ -87,19 +88,20 @@ def _slugify_region_input(raw: str) -> List[str]:
         if s in VOIVODESHIPS:
             out.append(s)
         else:
-            # spróbuj mapowania z etykiety
             slug = label_to_slug.get(s)
             if slug:
                 out.append(slug)
             else:
-                # dopuszczamy, ale zweryfikujemy niżej
                 out.append(s)
     # walidacja
     bad = [s for s in out if s not in VOIVODESHIPS]
     if bad:
         valid = ", ".join(VOIVODESHIPS.keys())
-        raise SystemExit(f"Nieznane województwo/slug: {', '.join(bad)}\nDozwolone slugi: {valid}\n"
-                         f"Albo użyj: --region all")
+        raise SystemExit(
+            f"Nieznane województwo/slug: {', '.join(bad)}\n"
+            f"Dozwolone slugi: {valid}\n"
+            f"Albo użyj: --region all"
+        )
     # deduplikacja z zachowaniem kolejności
     seen = set()
     uniq = []
@@ -110,7 +112,6 @@ def _slugify_region_input(raw: str) -> List[str]:
     return uniq
 
 
-# ------------------------------ Utils ------------------------------
 def add_or_replace_query_param(url: str, key: str, value: str) -> str:
     parts = list(urlparse(url))
     q = parse_qs(parts[4], keep_blank_values=True)
@@ -121,20 +122,36 @@ def add_or_replace_query_param(url: str, key: str, value: str) -> str:
 def _strip_accents(text: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
 
+# Ekstrakcja stabilnego klucza oferty (ID); fallback: znormalizowany URL
+_ID_RE = re.compile(r"/pl/oferta/[^/]*-(\d{5,})")
+
+def _offer_key(url: str) -> str:
+    m = _ID_RE.search(url)
+    return m.group(1) if m else url.rstrip("/")
+
+# ------------------------------ Parsowanie ------------------------------
 def parse_links_from_html(html: str, base_url: str) -> set[str]:
+    """
+    Zwraca zestaw linków do ofert /pl/oferta/ z listingu.
+    Rozszerzony selektor + JSON-LD. Normalizuje URL (bez query/fragmentu, bez trailing slash).
+    """
     soup = BeautifulSoup(html, "html.parser")
     links: set[str] = set()
 
-    # karty listingu
-    for a in soup.select('a[data-cy="listing-item-link"][href]'):
+    # Różne warianty markupu + fallback
+    for a in soup.select(
+        'a[data-cy="listing-item-link"][href], '
+        'a[data-testid="listing-item-link"][href], '
+        'a[href*="/pl/oferta/"]'
+    ):
         href = (a.get("href") or "").strip()
         if not href:
             continue
-        full = urljoin(base_url, href.split("?")[0])
+        full = urljoin(base_url, href.split("?")[0].split("#")[0]).rstrip("/")
         if "/pl/oferta/" in full:
             links.add(full)
 
-    # JSON-LD
+    # JSON-LD (dodatkowe źródło)
     for script in soup.find_all("script", {"type": "application/ld+json"}):
         raw = script.string or ""
         if not raw.strip():
@@ -154,7 +171,8 @@ def parse_links_from_html(html: str, base_url: str) -> set[str]:
                             for it in inner:
                                 u = (it or {}).get("url")
                                 if isinstance(u, str) and "/pl/oferta/" in u:
-                                    links.add(urljoin(base_url, u.split("?")[0]))
+                                    full2 = urljoin(base_url, u.split("?")[0].split("#")[0]).rstrip("/")
+                                    links.add(full2)
                 for v in node.values():
                     walk(v)
             elif isinstance(node, list):
@@ -163,7 +181,6 @@ def parse_links_from_html(html: str, base_url: str) -> set[str]:
 
         walk(data)
     return links
-
 
 # ------------------------------ FETCHERS ------------------------------
 class HttpFetcher:
@@ -209,43 +226,65 @@ class HttpFetcher:
         except Exception:
             pass
 
-
 def _make_fetcher():
     return HttpFetcher(wait_seconds=WAIT_SECONDS)
 
-
 # ------------------------------ Core ------------------------------
-def collect_links_all_pages(search_url: str,
-                            min_delay: float = 1.2,
-                            max_delay: float = 4.5) -> list[str]:
+def collect_links_all_pages(
+    search_url: str,
+    min_delay: float = 1.5,
+    max_delay: float = 5.0,
+    stop_after_k_empty_pages: int = 25,
+    max_pages: Optional[int] = None,  # None = bez limitu stron
+) -> list[str]:
     """
-    Iteruje po stronach 1..N aż do wyczerpania wyników (brak nowych linków).
+    Iteruje po stronach 1..N aż do wyczerpania wyników.
+    - Toleruje do 'stop_after_k_empty_pages' kolejnych stron bez nowych ofert (duplikaty/promowane).
+    - Dedupikacja po stabilnym kluczu oferty (ID) – odporna na zmiany tytułu/slug-a w URL.
+    - 'max_pages=None' oznacza brak twardego limitu liczby stron.
     """
     fetcher = _make_fetcher()
-    seen, out = set(), []
+    seen_keys, out = set(), []
     page = 1
+    empty_streak = 0
     try:
         while True:
+            if isinstance(max_pages, int) and page > max_pages:
+                print(f"[INFO] Osiągnięto limit {max_pages} stron – koniec.")
+                break
+
             url = search_url if page == 1 else add_or_replace_query_param(search_url, "page", page)
             ok = fetcher.get(url)
             if not ok:
-                # jeżeli nie wczytało 1. strony – przerywamy; jeśli później – zakładamy koniec
                 if page == 1:
                     print(f"[ERR] Nie udało się pobrać pierwszej strony: {url}")
                 break
+
             html = fetcher.page_source()
             base_url = fetcher.current_url() or search_url
             links = parse_links_from_html(html, base_url)
 
-            new_links = [u for u in links if u not in seen]
-            if not new_links:
-                # brak nowych linków → koniec paginacji
-                print(f"[INFO] Strona {page}: brak nowych linków – koniec.")
+            if not links:
+                print(f"[INFO] Strona {page}: brak jakichkolwiek linków – koniec.")
                 break
 
-            print(f"[INFO] Strona {page}: znaleziono {len(new_links)} nowych linków (łącznie {len(seen) + len(new_links)}).")
-            seen.update(new_links)
-            out.extend(new_links)
+            new_links = []
+            for u in links:
+                k = _offer_key(u)
+                if k not in seen_keys:
+                    seen_keys.add(k)
+                    new_links.append(u)
+
+            if new_links:
+                out.extend(new_links)
+                empty_streak = 0
+                print(f"[INFO] Strona {page}: {len(new_links)} nowych (łącznie {len(out)}).")
+            else:
+                empty_streak += 1
+                print(f"[INFO] Strona {page}: 0 nowych (seria {empty_streak}/{stop_after_k_empty_pages}).")
+                if empty_streak >= stop_after_k_empty_pages:
+                    print("[INFO] Zbyt wiele stron bez nowych ofert – przerywam.")
+                    break
 
             page += 1
             time.sleep(_RNG.uniform(min_delay, max_delay))
@@ -253,7 +292,7 @@ def collect_links_all_pages(search_url: str,
         fetcher.close()
     return out
 
-
+# ------------------------------ CSV ------------------------------
 def _read_existing_links(csv_path: Path) -> set[str]:
     existing: set[str] = set()
     if not csv_path.exists() or csv_path.stat().st_size == 0:
@@ -278,22 +317,34 @@ def _read_existing_links(csv_path: Path) -> set[str]:
                     existing.add(u)
     return existing
 
-
 def append_links_with_timestamp(links: Iterable[str], csv_path: Path) -> int:
+    """
+    Zapisuje tylko nowe oferty – deduplikacja po ID (jeśli jest) oraz po pełnym URL.
+    """
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    existing = _read_existing_links(csv_path)
-    new = [u for u in links if u not in existing]
+
+    existing_links = _read_existing_links(csv_path)
+    existing_keys = { _offer_key(u) for u in existing_links }
+
+    to_write = []
+    for u in links:
+        key = _offer_key(u)
+        if (u not in existing_links) and (key not in existing_keys):
+            to_write.append(u)
+            existing_links.add(u)
+            existing_keys.add(key)
+
     write_header = not csv_path.exists() or csv_path.stat().st_size == 0
     with csv_path.open("a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         if write_header:
             w.writerow(["link", "captured_date", "captured_time"])
-        for u in new:
+        for u in to_write:
             now = datetime.now(tz=_TZ) if _TZ else datetime.now()
             w.writerow([u, now.date().isoformat(), now.time().isoformat(timespec="seconds")])
-    return len(new)
+    return len(to_write)
 
-
+# ------------------------------ Runner ------------------------------
 def run_for_region(slug: str) -> tuple[int, int]:
     """
     Zwraca (total_found, newly_appended)
@@ -308,11 +359,16 @@ def run_for_region(slug: str) -> tuple[int, int]:
     print(f"[INFO] URL startowy: {start_url}")
     print(f"[INFO] Plik intake:  {csv_path.name}")
 
-    links = collect_links_all_pages(start_url)
+    links = collect_links_all_pages(
+        start_url,
+        min_delay=1.5,
+        max_delay=5.0,
+        stop_after_k_empty_pages=25,
+        max_pages=None,  # bez limitu stron
+    )
     added = append_links_with_timestamp(links, csv_path)
     print(f"[OK] Zebrano {len(links)} linków, dopisano {added} nowych do {csv_path.name}")
     return (len(links), added)
-
 
 # --------------------------- CLI ---------------------------
 if __name__ == "__main__":

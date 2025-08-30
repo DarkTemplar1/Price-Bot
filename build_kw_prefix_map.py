@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
+import argparse
 import re
 import unicodedata
 from pathlib import Path
 from typing import Optional, List, Dict
-
+import difflib
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
 ELI_URL = "https://eli.gov.pl/api/acts/DU/2015/1613/text.html"
 KW_RE = re.compile(r"^[A-Z]{2}\d[A-Z0-9]{1,2}$")
+FUZZY_THRESHOLD = 0.72
 
 DIAC_MAP = str.maketrans({
     "ą":"a","ć":"c","ę":"e","ł":"l","ń":"n","ó":"o","ś":"s","ź":"z","ż":"z",
@@ -27,6 +29,51 @@ STOP_SPLITS = [
     r"\s*w\s+tym\b",
 ]
 
+IRREG_LOC2NOM = {
+    "bielsku-białej":"Bielsko-Biała",
+    "białymstoku":"Białystok",
+    "bielsku podlaskim":"Bielsk Podlaski",
+    "starogardzie gdańskim":"Starogard Gdański",
+    "kartuzach":"Kartuzy",
+    "gliwicach":"Gliwice",
+    "jastrzębiu-zdroju":"Jastrzębie-Zdrój",
+    "raciborzu":"Racibórz",
+    "rudzie śląskiej":"Ruda Śląska",
+    "tarnowskich górach":"Tarnowskie Góry",
+    "wodzisławiu śląskim":"Wodzisław Śląski",
+    "żorach":"Żory",
+    "rybniku":"Rybnik",
+    "gorzowie wielkopolskim":"Gorzów Wielkopolski",
+    "strzelcach krajeńskich":"Strzelce Krajeńskie",
+    "jeleniej górze":"Jelenia Góra",
+    "kamiennej górze":"Kamienna Góra",
+    "lwówku śląskim":"Lwówek Śląski",
+    "katowicach":"Katowice",
+    "mysłowicach":"Mysłowice",
+    "tychach":"Tychy",
+    "busku-zdroju":"Busko-Zdrój",
+    "starachowicach":"Starachowice",
+    "kielcach":"Kielce",
+    "ostrowcu świętokrzyskim":"Ostrowiec Świętokrzyski",
+    "skarżysku-kamiennej":"Skarżysko-Kamienna",
+    "wadowicach":"Wadowice",
+    "myślenicach":"Myślenice",
+    "oświęcimiu":"Oświęcim",
+    "nowym mieście lubawskim":"Nowe Miasto Lubawskie",
+    "środzie śląskiej":"Środa Śląska",
+    "świnoujściu":"Świnoujście",
+    "stargardzie szczecińskim":"Stargard",
+    "ostrówie wielkopolskim":"Ostrów Wielkopolski",
+    "zabrzu":"Zabrze",
+    "żyrardowie":"Żyrardów",
+    "piotrkowie trybunalskim":"Piotrków Trybunalski",
+    "tomaszowie mazowieckim":"Tomaszów Mazowiecki",
+    "grodzisku mazowieckim":"Grodzisk Mazowiecki",
+    "sochaczewie":"Sochaczew",
+    "poznaniu":"Poznań",
+    "poznańiu":"Poznań",
+}
+
 def clean_text(s: str) -> str:
     if s is None:
         return ""
@@ -39,9 +86,7 @@ def clean_text(s: str) -> str:
     return s
 
 def norm_key(s: str) -> str:
-    s = clean_text(s).lower()
-    s = s.translate(DIAC_MAP)
-    return s
+    return clean_text(s).lower().translate(DIAC_MAP)
 
 def cut_descriptors(s: str) -> str:
     s = clean_text(s)
@@ -62,7 +107,6 @@ def parse_codes_from_table(html: str) -> pd.DataFrame:
         soup = BeautifulSoup(html, "lxml")
     except Exception:
         soup = BeautifulSoup(html, "html.parser")
-
     rows = []
     for table in soup.find_all("table"):
         for tr in table.find_all("tr"):
@@ -78,7 +122,6 @@ def parse_codes_from_table(html: str) -> pd.DataFrame:
                 town = re.split(r"\s*[-–]\s*wydział.*|\s*z siedzibą.*|\s*w wydziale.*", town, flags=re.I)[0]
                 town = re.sub(r"[()\[\]]", "", town).strip(" .")
                 rows.append({"KW_PREFIX": code, "Miejscowość": town})
-
     if not rows:
         text = clean_text(BeautifulSoup(html, "html.parser").get_text("\n", strip=True))
         last_place = None
@@ -94,151 +137,192 @@ def parse_codes_from_table(html: str) -> pd.DataFrame:
                 town = re.sub(r"[()\[\]]", "", town).strip(" .")
                 rows.append({"KW_PREFIX": m.group(0), "Miejscowość": town})
                 last_place = None
-
     return pd.DataFrame(rows).drop_duplicates(subset=["KW_PREFIX"]).reset_index(drop=True)
 
 def load_teryt_df(teryt_path: Optional[Path]) -> Optional[pd.DataFrame]:
     if not teryt_path or not Path(teryt_path).exists():
         return None
     df = pd.read_excel(teryt_path)
-    required = ["Województwo","Powiat","Gmina","Miejscowość","Dzielnica"]
-    for c in required:
+    req = ["Województwo","Powiat","Gmina","Miejscowość","Dzielnica"]
+    for c in req:
         if c not in df.columns:
-            raise ValueError(f"Brak kolumny '{c}' w TERYT.xlsx")
-        df[c] = df[c].fillna("").map(lambda s: str(s).strip())
-    return df
+            raise ValueError(f"Brak kolumny '{c}' w {teryt_path}")
+    return df[req].fillna("").astype(str)
 
-def guess_nominative(locative: str, teryt_df: Optional[pd.DataFrame]) -> str:
-    base = re.sub(r"^(w|we)\s+", "", clean_text(locative), flags=re.I).strip()
-    if not base:
+def hyphen_loc2nom_component(w: str) -> str:
+    lw = w.lower()
+    if lw.endswith("sku"):
+        return w[:-3] + "sko"
+    if lw.endswith("cku"):
+        return w[:-3] + "cko"
+    if lw.endswith("ej"):
+        return w[:-2] + "a"
+    if lw.endswith("owie"):
+        return w[:-4] + "ów"
+    return w
+
+def hyphen_loc2nom(s: str) -> str:
+    return "-".join(hyphen_loc2nom_component(p) for p in s.split("-"))
+
+def generate_candidates(locative: str) -> List[str]:
+    b = clean_text(re.sub(r"^(w|we|na)\s+", "", locative, flags=re.I))
+    cands = {b}
+    if "-" in b:
+        cands.add(hyphen_loc2nom(b))
+    low = b.lower()
+    if low.endswith("owie"): cands.add(b[:-4] + "ów")
+    if low.endswith("niu"):  cands.add(b[:-2])
+    if low.endswith("iu"):   cands.add(b[:-2])
+    if low.endswith("ie"):   cands.update([b[:-2], b[:-2]+"ia"])
+    if low.endswith("y"):    cands.add(b[:-1] + "a")
+    if low.endswith("u"):    cands.update([b[:-1], b[:-1]+"ów"])
+    if low.endswith("ach"):  cands.update([b[:-3]+"e", b[:-3]+"y"])
+    return [x.strip(" .") for x in cands if x.strip()]
+
+def to_nominative(name_loc: str, teryt_df: Optional[pd.DataFrame]) -> str:
+    if not name_loc:
         return ""
-
-    if teryt_df is not None:
-        sub = teryt_df[teryt_df["Miejscowość"].str.lower() == base.lower()]
-        if len(sub) > 0:
-            return sub["Miejscowość"].iloc[0]
-
-    cand = [base]
-    low = base.lower()
-    if low.endswith("owie"): cand.append(base[:-4] + "ów")
-    if low.endswith("nie"):
-        cand.append(base[:-2])         # Olsztynie -> Olsztyn
-        cand.append(base[:-3] + "no")  # Gnieźnie -> Gniezno
-    if low.endswith("wie"):
-        cand.append(base[:-2] + "a")   # Warszawie -> Warszawa
-        cand.append(base[:-3] + "wa")
-    if low.endswith("ni"): cand.append(base + "a")   # Gdyni -> Gdynia
-    if low.endswith("i") and not low.endswith("ni"): cand.append(base + "a")
-    if low.endswith("y"): cand.append(base[:-1] + "a")  # Oleśnicy -> Oleśnica
-    if low.endswith("ie"):
-        cand.append(base[:-2] + "ia")
-        cand.append(base[:-2])
-    if low.endswith("u"):
-        cand.append(base[:-1] + "iec")  # Żywcu -> Żywiec
-        cand.append(base[:-1] + "ów")
-
+    base = clean_text(name_loc)
+    v = IRREG_LOC2NOM.get(base.lower())
+    if v:
+        return v
     if teryt_df is not None and not teryt_df.empty:
-        towns = teryt_df["Miejscowość"].dropna().unique().tolist()
+        mask = teryt_df["Miejscowość"].str.lower() == base.lower()
+        if mask.any():
+            return teryt_df.loc[mask, "Miejscowość"].iloc[0]
+    cands = generate_candidates(base)
+    if teryt_df is not None and not teryt_df.empty:
+        towns = teryt_df["Miejscowość"].astype(str).tolist()
         towns_norm = [norm_key(t) for t in towns]
-        for c in cand:
-            nk = norm_key(c)
-            best_i, best_score = -1, -10**9
-            for i, tn in enumerate(towns_norm):
-                pref = 0
-                for a, b in zip(nk, tn):
-                    if a == b: pref += 1
-                    else: break
-                score = pref - abs(len(nk) - len(tn))
-                if score > best_score:
-                    best_score, best_i = score, i
-            if best_i >= 0 and best_score >= max(1, len(nk)-2):
-                return towns[best_i]
+        for cn in [norm_key(c) for c in cands]:
+            if cn in towns_norm:
+                return towns[towns_norm.index(cn)]
+        target = norm_key(base)
+        best_name, best_ratio = None, 0.0
+        for name in towns:
+            ratio = difflib.SequenceMatcher(None, target, norm_key(name)).ratio()
+            if ratio > best_ratio:
+                best_ratio, best_name = ratio, name
+        if best_ratio >= FUZZY_THRESHOLD:
+            return best_name
+    return cands[0] if cands else base
 
-    return cand[0]
+def fill_from_teryt(miejsc: str, teryt_df: Optional[pd.DataFrame],
+                    pow_hint: str = "", gmi_hint: str = "", woj_hint: str = "") -> Dict[str,str]:
+    # FIX 1: poprawny warunek wstępny
+    if teryt_df is None or teryt_df.empty or not miejsc:
+        return {"Województwo":"","Powiat":"","Gmina":"","Miejscowość":miejsc or ""}
+    sub = teryt_df[teryt_df["Miejscowość"].str.lower() == miejsc.lower()]
+    if sub.empty:
+        return {"Województwo":"","Powiat":"","Gmina":"","Miejscowość":miejsc}
 
-def build_teryt_index(df: pd.DataFrame) -> Dict[str, Dict[str, List[str]]]:
-    df = df.copy()
-    df["key"] = df["Miejscowość"].map(norm_key)
-    grp = df.groupby("key", dropna=False)
-    index = {}
-    for k, g in grp:
-        index[k] = {
-            "woj": list(dict.fromkeys(g["Województwo"].tolist())),
-            "pow": list(dict.fromkeys(g["Powiat"].tolist())),
-            "gmi": list(dict.fromkeys(g["Gmina"].tolist())),
-            "town_variants": list(dict.fromkeys(g["Miejscowość"].tolist()))
-        }
-    return index
+    def pick_unique(d: pd.DataFrame) -> pd.Series:
+        if len(d) == 1:
+            return d.iloc[0]
+        # FIX 2: wektoryzowane porównania .map(norm_key)
+        if pow_hint:
+            mask = d["Powiat"].map(norm_key) == norm_key(pow_hint)
+            d2 = d[mask]
+            if len(d2) == 1: return d2.iloc[0]
+            if not d2.empty: d = d2
+        if gmi_hint:
+            mask = d["Gmina"].map(norm_key) == norm_key(gmi_hint)
+            d2 = d[mask]
+            if len(d2) == 1: return d2.iloc[0]
+            if not d2.empty: d = d2
+        if woj_hint:
+            mask = d["Województwo"].map(norm_key) == norm_key(woj_hint)
+            d2 = d[mask]
+            if len(d2) == 1: return d2.iloc[0]
+            if not d2.empty: d = d2
+        return d.sort_values(["Województwo","Powiat","Gmina","Miejscowość"]).iloc[0]
 
-def choose_powiat(miejsc: str, cand_powiaty: List[str]) -> str:
-    if not cand_powiaty:
-        return ""
-    if len(cand_powiaty) == 1:
-        return cand_powiaty[0]
-    nk = norm_key(miejsc)
-    for p in cand_powiaty:
-        if norm_key(p).startswith("m ") and nk in norm_key(p):
-            return p
-    for p in cand_powiaty:
-        if nk in norm_key(p):
-            return p
-    return ""
+    rec = pick_unique(sub)
+    return {"Województwo": rec["Województwo"],
+            "Powiat":      rec["Powiat"],
+            "Gmina":       rec["Gmina"],
+            "Miejscowość": rec["Miejscowość"]}
 
-def choose_gmina(miejsc: str, cand_gminy: List[str]) -> str:
-    if not cand_gminy:
-        return ""
-    if len(cand_gminy) == 1:
-        return cand_gminy[0]
-    nk = norm_key(miejsc)
-    for g in cand_gminy:
-        if norm_key(g) == nk:
-            return g
-    for g in cand_gminy:
-        if nk in norm_key(g):
-            return g
-    return ""
+def enrich_from_teryt(df_codes: pd.DataFrame, teryt_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    out_rows = []
+    # FIX 3: iterrows — pewne odczytywanie kolumn z PL znakami
+    for _, r in df_codes.iterrows():
+        woj_hint = clean_text(r.get("Województwo", ""))
+        pow_hint = clean_text(r.get("Powiat", ""))
+        gmi_hint = clean_text(r.get("Gmina", ""))
+        miejsc_loc = clean_text(r.get("Miejscowość", ""))
 
-def enrich_with_teryt(df_codes: pd.DataFrame, teryt_df: Optional[pd.DataFrame]) -> pd.DataFrame:
-    df_codes = df_codes.copy()
-    df_codes["Miejscowość"] = df_codes["Miejscowość"].map(lambda x: guess_nominative(x, teryt_df))
+        miejsc_nom = to_nominative(miejsc_loc, teryt_df)
+        canon = fill_from_teryt(miejsc_nom, teryt_df, pow_hint=pow_hint, gmi_hint=gmi_hint, woj_hint=woj_hint)
 
-    if teryt_df is None or teryt_df.empty:
-        df_codes["Województwo"] = ""
-        df_codes["Powiat"] = ""
-        df_codes["Gmina"] = ""
-        return df_codes
+        row = {c: r.get(c, "") for c in df_codes.columns}
+        for c in ("Województwo","Powiat","Gmina","Miejscowość"):
+            if c in row:
+                row[c] = canon.get(c, row[c])
+        if not row.get("Miejscowość"):
+            row["Miejscowość"] = miejsc_nom
+        out_rows.append(row)
 
-    idx = build_teryt_index(teryt_df)
+    return pd.DataFrame(out_rows, columns=df_codes.columns)
 
-    woj_out, pow_out, gmi_out = [], [], []
-    for _, row in df_codes.iterrows():
-        key = norm_key(row["Miejscowość"])
-        bucket = idx.get(key)
-        if not bucket:
-            woj_out.append(""); pow_out.append(""); gmi_out.append("")
-            continue
-        woj = bucket["woj"][0] if len(bucket["woj"]) == 1 else ""
-        powiat = choose_powiat(row["Miejscowość"], bucket["pow"])
-        gmina = choose_gmina(row["Miejscowość"], bucket["gmi"])
-        woj_out.append(woj); pow_out.append(powiat); gmi_out.append(gmina)
+def load_input_table(path: str) -> pd.DataFrame:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Nie znaleziono pliku wejściowego: {p.resolve()}")
+    if p.suffix.lower() in (".xlsx", ".xls"):
+        return pd.read_excel(p, dtype=str).fillna("")
+    errors = []
+    for enc in ("utf-8-sig", "utf-8", "cp1250"):
+        try:
+            return pd.read_csv(p, dtype=str, sep=None, engine="python", encoding=enc).fillna("")
+        except Exception as e_auto:
+            errors.append(f"{enc}/auto: {e_auto}")
+            for sep in (";", ","):
+                try:
+                    return pd.read_csv(p, dtype=str, sep=sep, encoding=enc).fillna("")
+                except Exception as e_sep:
+                    errors.append(f"{enc}/{sep}: {e_sep}")
+    raise RuntimeError("Nie udało się wczytać CSV. Spróbuj zapisać plik w UTF-8 lub jako .xlsx.")
 
-    df_codes["Województwo"] = woj_out
-    df_codes["Powiat"] = pow_out
-    df_codes["Gmina"] = gmi_out
-    return df_codes
-
-def build_and_save(out_path: Path, teryt_path: Optional[Path] = Path("TERYT.xlsx")) -> pd.DataFrame:
+def build_from_eli(out_path: str, teryt_path: Optional[str]) -> None:
     html = fetch_eli_html()
     df = parse_codes_from_table(html)
-    teryt_df = load_teryt_df(teryt_path) if teryt_path else None
-    df = enrich_with_teryt(df, teryt_df)
-    cols = ["KW_PREFIX","Województwo","Powiat","Gmina","Miejscowość"]
-    df = df[cols].sort_values("KW_PREFIX").reset_index(drop=True)
-    df.to_excel(out_path, index=False, engine="openpyxl")
-    return df
+    teryt = load_teryt_df(Path(teryt_path)) if teryt_path else None
+    df["Województwo"] = ""
+    df["Powiat"] = ""
+    df["Gmina"] = ""
+    df = df[["KW_PREFIX","Województwo","Powiat","Gmina","Miejscowość"]]
+    df = enrich_from_teryt(df, teryt)
+    df.sort_values("KW_PREFIX", inplace=True)
+    df.to_excel(out_path, index=False)
+
+def process_from_file(in_path: str, teryt_path: Optional[str], out_path: str) -> None:
+    df = load_input_table(in_path)
+    need = ["KW_PREFIX","Województwo","Powiat","Gmina","Miejscowość"]
+    for c in need:
+        if c not in df.columns:
+            raise ValueError(f"Brak kolumny '{c}' w {in_path}")
+    teryt = load_teryt_df(Path(teryt_path)) if teryt_path else None
+    df = df[need].fillna("")
+    df = enrich_from_teryt(df, teryt)
+    df.sort_values("KW_PREFIX", inplace=True)
+    df.to_excel(out_path, index=False)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=["file","eli"], default="file")
+    ap.add_argument("--in", dest="input_path", default="KW_prefix_map.xlsx",
+                    help="Wejście dla trybu file: CSV/XLSX z kolumnami KW_PREFIX,Województwo,Powiat,Gmina,Miejscowość")
+    ap.add_argument("--teryt", dest="teryt_path", default="TERYT.xlsx",
+                    help="Ścieżka do TERYT.xlsx (arkusz z kolumnami Województwo,Powiat,Gmina,Miejscowość,Dzielnica)")
+    ap.add_argument("--out", dest="out_path", default="Nr KW.xlsx",
+                    help="Plik wyjściowy .xlsx")
+    args = ap.parse_args()
+
+    if args.mode == "eli":
+        build_from_eli(args.out_path, args.teryt_path if Path(args.teryt_path).exists() else None)
+    else:
+        process_from_file(args.input_path, args.teryt_path if Path(args.teryt_path).exists() else None, args.out_path)
 
 if __name__ == "__main__":
-    out = Path("KW_prefix_map.xlsx")
-    teryt = Path("TERYT.xlsx") if Path("TERYT.xlsx").exists() else None
-    df = build_and_save(out, teryt)
-    print(f"Zapisano: {out} (rekordów: {len(df)})")
+    main()
