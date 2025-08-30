@@ -3,13 +3,14 @@
 from __future__ import annotations
 import sys
 from pathlib import Path
-import re, unicodedata
 import pandas as pd
+import re
+import unicodedata
 
 SHEET_RAPORT = "raport"
 SHEET_ODF = "raport_odfiltrowane"
-COL_UDZ = "Czy udziały?"
 COL_PRZ = "Przeznaczenie (dla lokalu)"
+COL_UDZ = "Czy udziały?"
 
 def _norm(s: str) -> str:
     s = "".join(ch for ch in unicodedata.normalize("NFD", str(s or "")) if unicodedata.category(ch) != "Mn")
@@ -36,17 +37,19 @@ def main():
 
     src_sheet = _load_or_first(xlsx)
     df = pd.read_excel(xlsx, sheet_name=src_sheet, engine="openpyxl")
-    for col in (COL_UDZ, COL_PRZ):
-        if col not in df.columns:
-            print(f"[ERR] Brak kolumny: {col}")
-            sys.exit(2)
 
-    mask_nie = df[COL_UDZ].astype(str).str.contains(r"\bnie\b", case=False, na=False, regex=True)
-    mask_lokal = df[COL_PRZ].apply(lambda v: _norm(v) == "lokal mieszkalny")
-    mask_keep = mask_nie & mask_lokal
+    need = [COL_PRZ, COL_UDZ]
+    missing = [c for c in need if c not in df.columns]
+    if missing:
+        print(f"[ERR] Brak kolumn: {', '.join(missing)}")
+        sys.exit(2)
 
-    to_move = df[~mask_keep].copy()
+    mask_prz_ok = df[COL_PRZ].apply(lambda v: _norm(v) == "lokal mieszkalny")
+    mask_udz_ok = df[COL_UDZ].astype(str).str.contains(r"\bnie\b", case=False, na=False, regex=True)
+
+    mask_keep = mask_prz_ok & mask_udz_ok
     stay = df[mask_keep].copy()
+    to_move = df[~mask_keep].copy()
 
     _ensure_odf(xlsx, list(df.columns))
     try:
@@ -61,7 +64,7 @@ def main():
         stay.to_excel(wr, sheet_name=src_sheet, index=False)
         new_odf.to_excel(wr, sheet_name=SHEET_ODF, index=False)
 
-    print(f"[OK] Przerzucono: {len(to_move)}  |  Pozostało: {len(stay)}")
+    print(f"[OK] Przerzucono: {len(to_move)} | Pozostało w '{src_sheet}': {len(stay)}")
 
 if __name__ == "__main__":
     main()

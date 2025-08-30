@@ -300,7 +300,7 @@ def run_for_region(slug: str) -> tuple[int, int]:
     """
     start_url = (
         f"https://www.otodom.pl/pl/wyniki/sprzedaz/mieszkanie/{slug}"
-        "?limit=36&ownerTypeSingleSelect=ALL&by=DEFAULT&direction=DESC"
+        "?limit=72&ownerTypeSingleSelect=ALL&by=DEFAULT&direction=DESC"
     )
     csv_path = BASE_DIR / f"intake_{slug}.csv"
 

@@ -9,13 +9,13 @@ from typing import Optional
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-# Dodane: import silnika Excela (jeśli używasz pandas/openpyxl gdzie indziej)
 import openpyxl  # noqa: F401
 
 DOZWOLONE_ROZSZERZENIA = {".xlsx", ".xls", ".xlsm", ".xlsb"}
 
 APP_TITLE = "Wybór pliku Excel"
 SCRIPT_DALEJ = "dalej.py"
+SCRIPT_KOLUMNY = "kolumny.py"  # skrypt przygotowujący arkusze/kolumny
 
 
 def wybierz_plik_excel(pierwsze_okno: Optional[tk.Tk] = None) -> Optional[Path]:
@@ -48,10 +48,6 @@ def wybierz_plik_excel(pierwsze_okno: Optional[tk.Tk] = None) -> Optional[Path]:
 
 
 def otworz_sortownie(sciezka_pliku: Optional[Path], root: tk.Tk):
-    """
-    Ukrywa main, ładuje sortownia.py PO ŚCIEŻCE i uruchamia modalnie run_modal(...).
-    Sortownia pracuje na wybranym pliku (obsłuży też pliki zabezpieczone).
-    """
     base = Path(__file__).resolve().parent
     sort_path = base / "sortownia.py"
 
@@ -78,7 +74,6 @@ def otworz_sortownie(sciezka_pliku: Optional[Path], root: tk.Tk):
         )
         return
 
-    # Ukryj main, uruchom sortownię modalnie, po zamknięciu przywróć main
     root.withdraw()
     try:
         mod.run_modal(str(sciezka_pliku) if sciezka_pliku else None)
@@ -94,9 +89,6 @@ def otworz_sortownie(sciezka_pliku: Optional[Path], root: tk.Tk):
 
 
 def uruchom_skrypt_subprocess(script_name: str, sciezka_pliku: Optional[Path]):
-    """
-    Dla 'dalej.py' – uruchamia osobny proces Pythona z przekazaną ścieżką do Excela.
-    """
     baza = Path(__file__).resolve().parent
     script_path = (baza / script_name).resolve()
     if not script_path.exists():
@@ -116,11 +108,41 @@ def uruchom_skrypt_subprocess(script_name: str, sciezka_pliku: Optional[Path]):
         messagebox.showerror("Błąd uruchamiania", f"Nie udało się uruchomić skryptu:\n{e}")
 
 
+def uruchom_kolumny_sync(sciezka_pliku: Optional[Path]):
+    """
+    Uruchamia 'kolumny.py' SYNCHRONICZNIE (czeka na zakończenie),
+    przekazując ścieżkę do wybranego pliku Excela.
+    """
+    baza = Path(__file__).resolve().parent
+    kol_path = (baza / SCRIPT_KOLUMNY).resolve()
+    if not kol_path.exists():
+        messagebox.showerror(
+            "Brak kolumny.py",
+            f"Nie znaleziono pliku: {kol_path}\nPominięto automatyczne dodanie kolumn.",
+        )
+        return
+
+    cmd = [sys.executable, str(kol_path)]
+    if sciezka_pliku is not None:
+        cmd.append(str(sciezka_pliku))
+
+    try:
+        subprocess.run(cmd, check=True)
+        messagebox.showinfo("Gotowe", "Przygotowanie pliku zakończone pomyślnie.")
+    except subprocess.CalledProcessError as e:
+        messagebox.showerror(
+            "Błąd kolumny.py",
+            f"Skrypt kolumny.py zakończył się błędem (kod {e.returncode}).\nSzczegóły w konsoli.",
+        )
+    except Exception as e:
+        messagebox.showerror("Błąd kolumny.py", f"Nie udało się uruchomić kolumny.py:\n{e}")
+
+
 def zbuduj_okno_glowne(sciezka_pliku: Path):
-    """Buduje okno z nazwą pliku i 3 przyciskami."""
+    """Drugie menu: ścieżka + przyciski operacji (w tym 'przygotowanie pliku')."""
     root = tk.Tk()
     root.title("Panel pliku Excel")
-    root.geometry("560x220")
+    root.geometry("620x240")
     root.resizable(False, False)
 
     ramka = tk.Frame(root, padx=16, pady=16)
@@ -130,7 +152,7 @@ def zbuduj_okno_glowne(sciezka_pliku: Path):
     naglowek.pack(anchor="w")
 
     etykieta_sciezka = tk.Label(
-        ramka, text=str(sciezka_pliku), wraplength=520, justify="left", font=("Segoe UI", 10)
+        ramka, text=str(sciezka_pliku), wraplength=580, justify="left", font=("Segoe UI", 10)
     )
     etykieta_sciezka.pack(anchor="w", pady=(4, 16))
 
@@ -157,8 +179,17 @@ def zbuduj_okno_glowne(sciezka_pliku: Path):
 
     nonlocal_sciezka = [sciezka_pliku]
 
+    # — Nowy guzik: przygotowanie pliku (dodanie arkuszy/kolumn) —
+    btn_kolumny = tk.Button(
+        przyciski,
+        text="przygotowanie pliku",
+        width=20,
+        command=lambda: uruchom_kolumny_sync(nonlocal_sciezka[0]),
+    )
+    btn_kolumny.grid(row=0, column=0, padx=6, pady=6)
+
     btn_zmien = tk.Button(przyciski, text="Wybierz inny plik", width=20, command=zmien_plik)
-    btn_zmien.grid(row=0, column=0, padx=6, pady=6)
+    btn_zmien.grid(row=0, column=1, padx=6, pady=6)
 
     btn_sort = tk.Button(
         przyciski,
@@ -166,7 +197,7 @@ def zbuduj_okno_glowne(sciezka_pliku: Path):
         width=20,
         command=lambda: otworz_sortownie(nonlocal_sciezka[0], root),
     )
-    btn_sort.grid(row=0, column=1, padx=6, pady=6)
+    btn_sort.grid(row=1, column=0, padx=6, pady=6)
 
     btn_dalej = tk.Button(
         przyciski,
@@ -174,16 +205,16 @@ def zbuduj_okno_glowne(sciezka_pliku: Path):
         width=20,
         command=lambda: uruchom_skrypt_subprocess(SCRIPT_DALEJ, nonlocal_sciezka[0]),
     )
-    btn_dalej.grid(row=0, column=2, padx=6, pady=6)
+    btn_dalej.grid(row=1, column=1, padx=6, pady=6)
 
     tip = tk.Label(
         ramka,
         text=(
-            "Uwaga: sortownia pracuje bezpośrednio na wskazanym pliku.\n"
-            "Przed 'operacje plikowe' usuwam pliki '_dane1.csv' i '_dane2.csv' obok pliku."
+            "Wskazówka: zacznij od „przygotowanie pliku”, aby dodać wymagane arkusze i kolumny.\n"
+            "Sortowanie i pozostałe operacje działają na aktualnie wskazanym pliku."
         ),
         fg="#555",
-        wraplength=520,
+        wraplength=580,
         justify="left",
         font=("Segoe UI", 9),
     )
@@ -193,7 +224,7 @@ def zbuduj_okno_glowne(sciezka_pliku: Path):
 
 
 def start():
-    """Pierwsze okno: tylko przycisk do wyboru pliku Excel."""
+    """Pierwsze okno: wybór pliku → przejście do drugiego menu (bez auto-uruchamiania kolumn)."""
     root = tk.Tk()
     root.title(APP_TITLE)
     root.geometry("600x250")
@@ -212,13 +243,15 @@ def start():
     def wybierz_i_przejdz():
         p = wybierz_plik_excel(root)
         if p:
-            # Tu kończymy pierwsze okno (zostanie zniszczone w wybierz_plik_excel)
+            # Bez automatycznego odpalania: od razu pokazujemy drugie menu,
+            # gdzie jest guzik „przygotowanie pliku”.
             zbuduj_okno_glowne(p)
 
     btn = tk.Button(ramka, text="Wybierz plik Excel…", width=22, command=wybierz_i_przejdz)
     btn.pack(pady=6)
 
     root.mainloop()
+
 
 
 if __name__ == "__main__":

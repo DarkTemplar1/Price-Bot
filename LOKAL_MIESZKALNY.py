@@ -40,7 +40,7 @@ def main():
         print(f"[ERR] Brak kolumny: {COL_PRZ}")
         sys.exit(2)
 
-    mask_ok = df[COL_PRZ].apply(lambda v: _norm(v) == "lokal mieszkalny")
+    mask_ok = df[COL_PRZ].apply(lambda v: _norm(v) == "LOKAL MIESZKALNY")
     to_move = df[~mask_ok].copy()
     stay = df[mask_ok].copy()
 
