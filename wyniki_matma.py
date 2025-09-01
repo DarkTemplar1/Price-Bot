@@ -28,6 +28,12 @@ def remove_outliers_iqr(df: pd.DataFrame, col: str = "cena_za_metr") -> pd.DataF
     mask = _coerce_numeric(df[col]).between(low, high)
     return df[mask]
 
+def mean_numeric(series: pd.Series) -> float | None:
+    s = _coerce_numeric(series).dropna()
+    if s.empty:
+        return None
+    return float(s.mean())
+
 def format_currency(v: float | None) -> str:
     if v is None: return "—"
     return f"{v:,.0f} zł".replace(",", " ").replace(".", ",")

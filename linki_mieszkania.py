@@ -4,25 +4,16 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import re
 import time
 import unicodedata
 from pathlib import Path
 from typing import Iterable, List, Optional
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
+
 import requests
 from bs4 import BeautifulSoup
-
-# --- (opcjonalnie) Selenium - nie używamy domyślnie ---
-try:
-    import undetected_chromedriver as uc  # noqa: F401
-    from selenium.webdriver.common.by import By  # noqa: F401
-    from selenium.webdriver.support.ui import WebDriverWait  # noqa: F401
-    from selenium.webdriver.support import expected_conditions as EC  # noqa: F401
-    _SELENIUM_AVAILABLE = True
-except Exception:
-    _SELENIUM_AVAILABLE = False
-
 from datetime import datetime
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
@@ -33,12 +24,24 @@ except Exception:
 from secrets import SystemRandom
 _RNG = SystemRandom()
 
-BASE_DIR = Path(__file__).resolve().parent
+# ------------------------------ WYJŚCIE: Desktop/Pulpit ------------------------------
+def _detect_desktop() -> Path:
+    home = Path.home()
+    for name in ("Desktop", "Pulpit"):
+        p = home / name
+        if p.exists():
+            return p
+    return home
+
+BASE_BAZA = _detect_desktop() / "baza danych"
+BASE_LINKI = BASE_BAZA / "linki"
+BASE_WOJ = BASE_BAZA / "województwa"
+BASE_LINKI.mkdir(parents=True, exist_ok=True)
+BASE_WOJ.mkdir(parents=True, exist_ok=True)
+# -------------------------------------------------------------------------------------
 
 WAIT_SECONDS = 20
 RETRIES_NAV = 3
-USE_SELENIUM = False  # domyślnie bez przeglądarki
-
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -47,7 +50,7 @@ USER_AGENT = (
 # Kolejność ustalona, by raport był przewidywalny
 VOIVODESHIPS_ORDERED: List[tuple[str, str]] = [
     ("dolnoslaskie", "Dolnośląskie"),
-    ("kujawsko-pomorskie", "Kujawsko-Pomorskie"),
+    ("kujawsko--pomorskie", "Kujawsko-Pomorskie"),
     ("lubelskie", "Lubelskie"),
     ("lubuskie", "Lubuskie"),
     ("lodzkie", "Łódzkie"),
@@ -64,22 +67,13 @@ VOIVODESHIPS_ORDERED: List[tuple[str, str]] = [
     ("zachodniopomorskie", "Zachodniopomorskie"),
 ]
 VOIVODESHIPS = dict(VOIVODESHIPS_ORDERED)
-DEFAULT_REGION = "all"  # <- teraz domyślnie wszystkie
+DEFAULT_REGION = "all"  # domyślnie wszystkie
 
 # ------------------------------ Utils ------------------------------
 def _slugify_region_input(raw: str) -> List[str]:
-    """
-    Przyjmuje:
-      - 'all'  → wszystkie slugi
-      - pojedynczy slug lub etykietę ('mazowieckie' / 'Mazowieckie')
-      - listę po przecinku ('mazowieckie,slaskie' lub 'Mazowieckie, Śląskie')
-    Zwraca listę SLUGÓW.
-    """
     if not raw or raw.strip().lower() == "all":
         return [slug for slug, _ in VOIVODESHIPS_ORDERED]
-
     label_to_slug = {v.lower(): k for k, v in VOIVODESHIPS.items()}
-
     out: List[str] = []
     for part in raw.split(","):
         s = part.strip().lower()
@@ -93,7 +87,6 @@ def _slugify_region_input(raw: str) -> List[str]:
                 out.append(slug)
             else:
                 out.append(s)
-    # walidacja
     bad = [s for s in out if s not in VOIVODESHIPS]
     if bad:
         valid = ", ".join(VOIVODESHIPS.keys())
@@ -102,7 +95,6 @@ def _slugify_region_input(raw: str) -> List[str]:
             f"Dozwolone slugi: {valid}\n"
             f"Albo użyj: --region all"
         )
-    # deduplikacja z zachowaniem kolejności
     seen = set()
     uniq = []
     for s in out:
@@ -110,7 +102,6 @@ def _slugify_region_input(raw: str) -> List[str]:
             uniq.append(s)
             seen.add(s)
     return uniq
-
 
 def add_or_replace_query_param(url: str, key: str, value: str) -> str:
     parts = list(urlparse(url))
@@ -122,23 +113,15 @@ def add_or_replace_query_param(url: str, key: str, value: str) -> str:
 def _strip_accents(text: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
 
-# Ekstrakcja stabilnego klucza oferty (ID); fallback: znormalizowany URL
 _ID_RE = re.compile(r"/pl/oferta/[^/]*-(\d{5,})")
-
 def _offer_key(url: str) -> str:
     m = _ID_RE.search(url)
     return m.group(1) if m else url.rstrip("/")
 
 # ------------------------------ Parsowanie ------------------------------
 def parse_links_from_html(html: str, base_url: str) -> set[str]:
-    """
-    Zwraca zestaw linków do ofert /pl/oferta/ z listingu.
-    Rozszerzony selektor + JSON-LD. Normalizuje URL (bez query/fragmentu, bez trailing slash).
-    """
     soup = BeautifulSoup(html, "html.parser")
     links: set[str] = set()
-
-    # Różne warianty markupu + fallback
     for a in soup.select(
         'a[data-cy="listing-item-link"][href], '
         'a[data-testid="listing-item-link"][href], '
@@ -151,7 +134,6 @@ def parse_links_from_html(html: str, base_url: str) -> set[str]:
         if "/pl/oferta/" in full:
             links.add(full)
 
-    # JSON-LD (dodatkowe źródło)
     for script in soup.find_all("script", {"type": "application/ld+json"}):
         raw = script.string or ""
         if not raw.strip():
@@ -160,7 +142,6 @@ def parse_links_from_html(html: str, base_url: str) -> set[str]:
             data = json.loads(raw)
         except json.JSONDecodeError:
             continue
-
         def walk(node):
             if isinstance(node, dict):
                 if node.get("@type") == "Product":
@@ -178,11 +159,10 @@ def parse_links_from_html(html: str, base_url: str) -> set[str]:
             elif isinstance(node, list):
                 for v in node:
                     walk(v)
-
         walk(data)
     return links
 
-# ------------------------------ FETCHERS ------------------------------
+# ------------------------------ FETCHER ------------------------------
 class HttpFetcher:
     def __init__(self, wait_seconds: int = WAIT_SECONDS):
         self.sess = requests.Session()
@@ -229,20 +209,76 @@ class HttpFetcher:
 def _make_fetcher():
     return HttpFetcher(wait_seconds=WAIT_SECONDS)
 
+# ------------------------------ Liczba ogłoszeń → liczba stron ------------------------------
+PREFERRED_KEYS = {"total","totalCount","totalResults","totalElements","searchTotal","numberOfResults"}
+
+def _to_int(s: str) -> int | None:
+    s = re.sub(r"\D+", "", s or "")
+    return int(s) if s else None
+
+def _extract_total_from_next_data(html: str) -> int | None:
+    m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, flags=re.S)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+    best = None
+    stack = [data]
+    while stack:
+        obj = stack.pop()
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(v, (int, float)) and k in PREFERRED_KEYS:
+                    best = max(best or 0, int(v))
+                elif isinstance(v, (dict, list)):
+                    stack.append(v)
+        elif isinstance(obj, list):
+            stack.extend(obj)
+    return best
+
+def _extract_total_from_text(html: str) -> int | None:
+    text = re.sub(r"\s+", " ", html)
+    m = re.search(r"ogłoszeń\s+z\s+([\d\s\u00A0]+)", text, flags=re.I)
+    if m and (n := _to_int(m.group(1))):
+        return n
+    m = re.search(r"Znaleziono\s+([\d\s\u00A0]+)\s+ogłosze", text, flags=re.I)
+    if m and (n := _to_int(m.group(1))):
+        return n
+    return None
+
+def _fetch_total_results(url: str, user_agent: str) -> int:
+    headers = {"User-Agent": user_agent, "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7"}
+    r = requests.get(url, headers=headers, timeout=20)
+    r.raise_for_status()
+    html = r.text
+    total = _extract_total_from_next_data(html) or _extract_total_from_text(html)
+    if total is None:
+        raise RuntimeError("Nie udało się znaleźć liczby ogłoszeń.")
+    return total
+
+def _limit_from_url(url: str, default: int = 36) -> int:
+    q = parse_qs(urlparse(url).query)
+    try:
+        return int((q.get("limit") or [default])[0])
+    except Exception:
+        return default
+
+def _pages_from_total(url: str, user_agent: str) -> tuple[int, int, int]:
+    total = _fetch_total_results(url, user_agent)
+    limit = _limit_from_url(url, default=36)  # zwykle 36 lub 72
+    pages = math.ceil(total / max(limit, 1))
+    return pages, total, limit
+
 # ------------------------------ Core ------------------------------
 def collect_links_all_pages(
     search_url: str,
     min_delay: float = 1.5,
     max_delay: float = 5.0,
     stop_after_k_empty_pages: int = 25,
-    max_pages: Optional[int] = None,  # None = bez limitu stron
+    max_pages: Optional[int] = None,
 ) -> list[str]:
-    """
-    Iteruje po stronach 1..N aż do wyczerpania wyników.
-    - Toleruje do 'stop_after_k_empty_pages' kolejnych stron bez nowych ofert (duplikaty/promowane).
-    - Dedupikacja po stabilnym kluczu oferty (ID) – odporna na zmiany tytułu/slug-a w URL.
-    - 'max_pages=None' oznacza brak twardego limitu liczby stron.
-    """
     fetcher = _make_fetcher()
     seen_keys, out = set(), []
     page = 1
@@ -318,14 +354,9 @@ def _read_existing_links(csv_path: Path) -> set[str]:
     return existing
 
 def append_links_with_timestamp(links: Iterable[str], csv_path: Path) -> int:
-    """
-    Zapisuje tylko nowe oferty – deduplikacja po ID (jeśli jest) oraz po pełnym URL.
-    """
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-
     existing_links = _read_existing_links(csv_path)
-    existing_keys = { _offer_key(u) for u in existing_links }
-
+    existing_keys = {_offer_key(u) for u in existing_links}
     to_write = []
     for u in links:
         key = _offer_key(u)
@@ -333,7 +364,6 @@ def append_links_with_timestamp(links: Iterable[str], csv_path: Path) -> int:
             to_write.append(u)
             existing_links.add(u)
             existing_keys.add(key)
-
     write_header = not csv_path.exists() or csv_path.stat().st_size == 0
     with csv_path.open("a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -346,25 +376,30 @@ def append_links_with_timestamp(links: Iterable[str], csv_path: Path) -> int:
 
 # ------------------------------ Runner ------------------------------
 def run_for_region(slug: str) -> tuple[int, int]:
-    """
-    Zwraca (total_found, newly_appended)
-    """
     start_url = (
         f"https://www.otodom.pl/pl/wyniki/sprzedaz/mieszkanie/{slug}"
         "?limit=72&ownerTypeSingleSelect=ALL&by=DEFAULT&direction=DESC"
     )
-    csv_path = BASE_DIR / f"intake_{slug}.csv"
+    csv_path = BASE_LINKI / f"intake_{slug}.csv"   # <<< ZAPIS NA PULPICIE / baza danych / linki
 
     print(f"\n========== {VOIVODESHIPS[slug]} ({slug}) ==========")
     print(f"[INFO] URL startowy: {start_url}")
-    print(f"[INFO] Plik intake:  {csv_path.name}")
+    print(f"[INFO] Plik intake:  {csv_path}")
+
+    try:
+        pages, total, limit = _pages_from_total(start_url, USER_AGENT)
+        print(f"[INFO] Ogłoszeń łącznie: {total} | limit/stronę: {limit} | stron do sprawdzenia: {pages}")
+        max_pages = pages
+    except Exception as e:
+        print(f"[WARN] Nie udało się ustalić liczby stron ({e}). Lecę bez twardego limitu.")
+        max_pages = None
 
     links = collect_links_all_pages(
         start_url,
         min_delay=1.5,
         max_delay=5.0,
         stop_after_k_empty_pages=25,
-        max_pages=None,  # bez limitu stron
+        max_pages=max_pages,
     )
     added = append_links_with_timestamp(links, csv_path)
     print(f"[OK] Zebrano {len(links)} linków, dopisano {added} nowych do {csv_path.name}")
@@ -382,14 +417,12 @@ if __name__ == "__main__":
     args = ap.parse_args()
 
     region_slugs = _slugify_region_input(args.region)
-
     total_found = 0
     total_added = 0
     for slug in region_slugs:
         found, added = run_for_region(slug)
         total_found += found
         total_added += added
-        # mała przerwa między województwami
         time.sleep(_RNG.uniform(1.0, 2.5))
 
     print("\n=========== PODSUMOWANIE ===========")

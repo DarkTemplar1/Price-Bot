@@ -1,27 +1,54 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import argparse
 import csv
 import json
 import re
 import time
 from http.client import RemoteDisconnected
 from pathlib import Path
+
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+from openpyxl import Workbook, load_workbook
+
+# ------------------------------ WYJŚCIE: Desktop/Pulpit ------------------------------
+def _detect_desktop() -> Path:
+    home = Path.home()
+    for name in ("Desktop", "Pulpit"):
+        p = home / name
+        if p.exists():
+            return p
+    return home
+
+BASE_BAZA = _detect_desktop() / "baza danych"
+BASE_LINKI = BASE_BAZA / "linki"
+BASE_WOJ   = BASE_BAZA / "województwa"
+BASE_LINKI.mkdir(parents=True, exist_ok=True)
+BASE_WOJ.mkdir(parents=True, exist_ok=True)
+
+# jeden wspólny plik dla wszystkich województw:
+SINGLE_XLSX = BASE_WOJ / "wojewodztwa.xlsx"
+# -------------------------------------------------------------------------------------
+
 from adres_otodom import (
     set_contact_email,
     parsuj_adres_string,
     uzupelnij_braki_z_nominatim,
     dopelnij_powiat_gmina_jesli_brak,
     _clean_gmina,
-    _tylko_dzielnica,
     _consistency_pass_row,
 )
 
 CONTACT_EMAIL = "twoj_email@domena.pl"
 WAIT_SECONDS = 20
+set_contact_email(CONTACT_EMAIL)
 
 szukane_pola = {
     "Cena": "cena",
@@ -34,7 +61,6 @@ szukane_pola = {
     "Materiał budynku": "material",
 }
 
-# — rozszerzone synonimy (dodane Piętro i inne warianty) —
 LABEL_SYNONYMS = {
     "Liczba pokoi": ("liczba_pokoi", ["Liczba pokoi"]),
     "Rynek": ("rynek", ["Rynek", "Typ rynku"]),
@@ -61,9 +87,6 @@ KOLUMNY_WYJ = [
     "link",
 ]
 
-set_contact_email(CONTACT_EMAIL)
-
-
 def format_pln_int(x) -> str | None:
     if x is None:
         return None
@@ -71,7 +94,6 @@ def format_pln_int(x) -> str | None:
         return f"{int(x):,} zł".replace(",", " ")
     except Exception:
         return None
-
 
 def fmt_metry(value) -> str | None:
     if value is None:
@@ -83,13 +105,11 @@ def fmt_metry(value) -> str | None:
     except Exception:
         return None
 
-
 def _num(s: str):
     if not s:
         return None
     digits = re.sub(r"[^\d]", "", s)
     return int(digits) if digits else None
-
 
 def oblicz_cena_za_metr(cena_str: str, metry_str: str) -> str:
     try:
@@ -102,10 +122,8 @@ def oblicz_cena_za_metr(cena_str: str, metry_str: str) -> str:
     except Exception:
         return ""
 
-
 def _norm_txt(s: str | None) -> str:
     return re.sub(r"\s+", " ", (s or "").replace("\xa0", " ")).strip()
-
 
 def _extract_by_labels_generic(soup, wynik: dict):
     labels = []
@@ -117,17 +135,14 @@ def _extract_by_labels_generic(soup, wynik: dict):
     if not labels:
         return
     pat = re.compile(rf"^(?:{'|'.join(labels)})\s*:?\s*$", re.I)
-
     for node in soup.find_all(string=pat):
         lab_raw = _norm_txt(node)
         lab = re.sub(r":$", "", lab_raw, flags=re.I)
         key = label_to_key.get(lab.lower())
         if not key or wynik.get(key):
             continue
-
         val = None
         parent = node.parent
-
         for cand in (
             getattr(parent, "next_sibling", None),
             getattr(parent, "find_next_sibling", lambda: None)(),
@@ -138,15 +153,12 @@ def _extract_by_labels_generic(soup, wynik: dict):
                 if t and t.lower() != lab.lower():
                     val = t
                     break
-
         if not val:
             nxt = node.find_next(string=lambda t: _norm_txt(t) and _norm_txt(t).lower() != lab.lower())
             if nxt:
                 val = _norm_txt(nxt)
-
         if val:
             wynik[key] = val
-
 
 _REMOTE_CLOSED_MARKERS = (
     "remote end closed connection without response",
@@ -154,14 +166,11 @@ _REMOTE_CLOSED_MARKERS = (
     "connection reset",
     "chunked encoding",
 )
-
-
 def _is_remote_closed(exc: Exception) -> bool:
     s = (str(exc) or "").lower()
     if isinstance(exc, RemoteDisconnected):
         return True
     return any(m in s for m in _REMOTE_CLOSED_MARKERS)
-
 
 def _safe_enrich_address(adr: dict, tries: int = 5, base_sleep: float = 1.2) -> dict:
     cur = dict(adr or {})
@@ -178,15 +187,11 @@ def _safe_enrich_address(adr: dict, tries: int = 5, base_sleep: float = 1.2) -> 
     print("[WARN] Nominatim: zrezygnowano po wielokrotnych próbach")
     return cur
 
-
-# --- NOWOŚĆ: stabilny odczyt bieżącej ceny z DOM (meta tylko jako fallback) ---
 PRICE_SELECTORS = [
     "strong[data-testid='ad-price']",
     "[data-testid='ad-price']",
     "[data-cy='ad-price']",
 ]
-
-
 def _extract_price_from_dom(soup, wynik: dict):
     for sel in PRICE_SELECTORS:
         el = soup.select_one(sel)
@@ -196,8 +201,6 @@ def _extract_price_from_dom(soup, wynik: dict):
                 wynik["cena"] = txt
                 return
 
-
-# --- NOWOŚĆ: adres z JSON-LD jako dodatkowy fallback/uzupełnienie ulicy ---
 def _address_from_jsonld(soup) -> str:
     for s in soup.find_all("script", attrs={"type": "application/ld+json"}):
         raw = (s.string or "").strip()
@@ -229,8 +232,6 @@ def _address_from_jsonld(soup) -> str:
                     return s
     return ""
 
-
-# --- Selenium bez undetected_chromedriver ---
 def _pobierz_soup(url: str):
     opts = Options()
     opts.add_argument("--start-maximized")
@@ -240,8 +241,7 @@ def _pobierz_soup(url: str):
     opts.add_experimental_option("useAutomationExtension", False)
     opts.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
 
     driver = webdriver.Chrome(options=opts)
@@ -249,9 +249,7 @@ def _pobierz_soup(url: str):
         try:
             driver.execute_cdp_cmd(
                 "Page.addScriptToEvaluateOnNewDocument",
-                {
-                    "source": "Object.defineProperty(navigator,'webdriver',{get:() => undefined})"
-                },
+                {"source": "Object.defineProperty(navigator,'webdriver',{get:() => undefined})"},
             )
         except Exception:
             pass
@@ -284,17 +282,14 @@ def _pobierz_soup(url: str):
         driver.quit()
     return BeautifulSoup(html, "html.parser")
 
-
 def _wyciagnij_adres_string(soup) -> str:
-    mapa_link = soup.select_one("a[href='#map']")
-    if not mapa_link:
-        mapa_link = soup.select_one("a[href*='mapa']") or soup.find("span", attrs={"data-cy": "adPageAdLocalisation"})
+    mapa_link = soup.select_one("a[href='#map']") or soup.select_one("a[href*='mapa']") \
+        or soup.find("span", attrs={"data-cy": "adPageAdLocalisation"})
     if mapa_link:
         t = mapa_link.get_text(strip=True)
         print("📍 Adres z UI:", t)
         return t
     return ""
-
 
 def _fill_from_jsonld(obj, wynik: dict):
     if not isinstance(obj, (dict, list)):
@@ -303,30 +298,24 @@ def _fill_from_jsonld(obj, wynik: dict):
     for it in items:
         if not isinstance(it, dict):
             continue
-
         offers = it.get("offers") or it.get("offer")
         if isinstance(offers, dict):
             if "cena" not in wynik and offers.get("price"):
                 wynik["cena"] = format_pln_int(offers.get("price")) or wynik.get("cena")
-
         floor_size = it.get("floorSize") or it.get("floorArea")
         if isinstance(floor_size, dict) and "metry" not in wynik:
             v = floor_size.get("value") or it.get("valueReference")
             m2 = fmt_metry(v)
             if m2:
                 wynik["metry"] = m2
-
         if "liczba_pokoi" not in wynik and it.get("numberOfRooms"):
             wynik["liczba_pokoi"] = str(_num(str(it.get("numberOfRooms"))))
-
         if "rok_budowy" not in wynik and it.get("yearBuilt"):
             wynik["rok_budowy"] = str(it["yearBuilt"])
-
         if "material" not in wynik and it.get("material"):
             mat = it.get("material")
             if isinstance(mat, str):
                 wynik["material"] = mat
-
         if "rynek" not in wynik and it.get("itemCondition"):
             cond = str(it["itemCondition"]).lower()
             if "new" in cond:
@@ -334,28 +323,21 @@ def _fill_from_jsonld(obj, wynik: dict):
             elif "used" in cond:
                 wynik["rynek"] = "wtórny"
 
-
 def pobierz_dane_z_otodom(url: str) -> dict:
     soup = _pobierz_soup(url)
     wynik = {}
-
-    # 1) najpierw próbujemy cenę z DOM (bieżąca)
     _extract_price_from_dom(soup, wynik)
 
-    # 2) meta description tylko jako fallback (+ pietro/metraz jak dotychczas)
     opis = soup.find("meta", attrs={"name": "description"})
     if opis and opis.has_attr("content"):
         content = opis["content"]
-
         if "cena" not in wynik:
             cena_match = re.search(r"za cenę ([\d\s]+zł)", content)
             if cena_match:
                 wynik["cena"] = cena_match.group(1).strip()
-
         metry_match = re.search(r"ma ([\d.,]+ m²)", content)
         if metry_match:
             wynik["metry"] = metry_match.group(1).strip()
-
         pietro_match = re.search(r"na ([^,\.]+? piętrze)", content)
         if pietro_match:
             pietro_raw = pietro_match.group(1).strip().lower()
@@ -365,7 +347,6 @@ def pobierz_dane_z_otodom(url: str) -> dict:
                 tylko_numer = re.search(r"\d+", pietro_raw)
                 wynik["pietro"] = tylko_numer.group() if tylko_numer else ""
 
-    # cena za metr – selektory jak dotąd
     for sel in [
         "strong[data-testid='ad-price-per-m']",
         "div[data-testid='ad-price-per-m']",
@@ -379,7 +360,6 @@ def pobierz_dane_z_otodom(url: str) -> dict:
             wynik["cena_za_metr"] = el.get_text(strip=True)
             break
 
-    # twarde szczegóły z tabeli
     szczegoly = soup.select("div[data-testid='table-value']")
     for item in szczegoly:
         label_elem = item.select_one("div[data-testid='table-value-title']")
@@ -390,18 +370,8 @@ def pobierz_dane_z_otodom(url: str) -> dict:
             if label in szukane_pola and szukane_pola[label] not in wynik:
                 wynik[szukane_pola[label]] = value
 
-    # alternatywny layout (paragrafy)
-    paragrafy = soup.find_all("p", class_="e4rbt3a2")
-    for i in range(len(paragrafy) - 1):
-        label = paragrafy[i].get_text(strip=True).replace(":", "")
-        value = paragrafy[i + 1].get_text(strip=True)
-        if label in szukane_pola and szukane_pola[label] not in wynik:
-            wynik[szukane_pola[label]] = value
-
-    # generyczny ekstraktor po etykietach (teraz też Piętro/Kondygnacja/Poziom)
     _extract_by_labels_generic(soup, wynik)
 
-    # JSON-LD: dane liczbowe + później także adres/ulica
     try:
         for s in soup.find_all("script", attrs={"type": "application/ld+json"}):
             raw = (s.string or "").strip()
@@ -419,21 +389,17 @@ def pobierz_dane_z_otodom(url: str) -> dict:
     except Exception:
         pass
 
-    # Adres: UI → JSON-LD (fallback, często ze streetAddress)
     adres_string = _wyciagnij_adres_string(soup)
     adr_jsonld_str = _address_from_jsonld(soup)
     if adr_jsonld_str and len(adr_jsonld_str) > len(adres_string):
         adres_string = adr_jsonld_str
 
     adr = parsuj_adres_string(adres_string)
-
-    # Wzbogacanie (Nominatim/TERYT wrapper)
     try:
         adr = _safe_enrich_address(adr)
     except Exception as e:
         print(f"[WARN] Enrichment failed: {e}")
 
-    # Jeśli po wzbogaceniu nadal brak ulicy – spróbuj wprost ze streetAddress z JSON-LD
     if not (adr.get("ulica_nazwa") or "").strip():
         try:
             for s in soup.find_all("script", attrs={"type": "application/ld+json"}):
@@ -448,7 +414,6 @@ def pobierz_dane_z_otodom(url: str) -> dict:
                     if isinstance(addr, dict):
                         street = addr.get("streetAddress")
                         if street:
-                            # weź nazwę bez numeru, jeśli jest
                             nazwa = re.sub(r"\s+\d.*$", "", street).strip()
                             adr["ulica_nazwa"] = nazwa or street.strip()
                             found = True
@@ -491,12 +456,41 @@ def pobierz_dane_z_otodom(url: str) -> dict:
     _consistency_pass_row(out)
     return out
 
+# ============== ZAPIS DO JEDNEGO EXCELA (osobne arkusze) ==============
+def _ensure_sheet_with_header(wb, sheetname: str, headers: list[str]):
+    if sheetname in wb.sheetnames:
+        ws = wb[sheetname]
+        if ws.max_row < 1 or all((c.value in (None, "")) for c in ws[1]):
+            for i, h in enumerate(headers, start=1):
+                ws.cell(row=1, column=i, value=h)
+        return ws
+    ws = wb.create_sheet(title=sheetname)
+    for i, h in enumerate(headers, start=1):
+        ws.cell(row=1, column=i, value=h)
+    return ws
 
-def przetworz_linki_z_intake_csv(input_csv: str, output_csv: str):
+def write_rows_to_single_xlsx(sheetname: str, rows: list[dict]):
+    if SINGLE_XLSX.exists():
+        wb = load_workbook(SINGLE_XLSX)
+    else:
+        wb = Workbook()
+        if "Sheet" in wb.sheetnames and len(wb.sheetnames) == 1:
+            wb.remove(wb["Sheet"])
+
+    ws = _ensure_sheet_with_header(wb, sheetname, KOLUMNY_WYJ)
+
+    for row in rows:
+        ws.append([row.get(col, "") for col in KOLUMNY_WYJ])
+
+    SINGLE_XLSX.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(SINGLE_XLSX)
+
+# ============== PIPE: czytaj linki (CSV) -> scrap -> JEDEN XLSX ==============
+def przetworz_linki_z_intake_csv_do_jednego_xlsx(input_csv: Path, sheetname: str):
     dane_lista = []
-    with open(input_csv, mode="r", encoding="utf-8") as plik_wejsciowy:
+    with input_csv.open(mode="r", encoding="utf-8") as plik_wejsciowy:
         reader = csv.reader(plik_wejsciowy)
-        next(reader, None)
+        next(reader, None)  # nagłówek
         for row in reader:
             if not row or not row[0].strip():
                 continue
@@ -515,52 +509,33 @@ def przetworz_linki_z_intake_csv(input_csv: str, output_csv: str):
                     print(f"❌ Błąd przy linku {link}: {e}")
                     dane = None
                     break
-
             if not dane:
                 continue
-
-            if not (dane.get("powiat") or "").strip() or not (dane.get("gmina") or "").strip():
-                _consistency_pass_row(dane)
-                temp_ad = {
-                    "ulica_nazwa": dane.get("ulica"),
-                    "nr": None,
-                    "miasto": dane.get("miejscowosc"),
-                    "dzielnica": dane.get("dzielnica"),
-                    "wojewodztwo": dane.get("wojewodztwo"),
-                    "gmina": dane.get("gmina"),
-                    "powiat": dane.get("powiat"),
-                    "oryginal": "",
-                }
-                try:
-                    temp_ad = dopelnij_powiat_gmina_jesli_brak(temp_ad)
-                    dane["gmina"] = dane.get("gmina") or _clean_gmina(temp_ad.get("gmina"))
-                    dane["powiat"] = dane.get("powiat") or temp_ad.get("powiat")
-                    _consistency_pass_row(dane)
-                except Exception as e:
-                    print(f"[WARN] Uzupełnianie powiat/gmina nie powiodło się: {e}")
-
             for k in KOLUMNY_WYJ:
                 dane.setdefault(k, "")
-
             dane_lista.append(dane)
 
     dane_lista = [r for r in dane_lista if (r.get("cena") or "").strip()]
 
-    p = Path(output_csv)
-    p.parent.mkdir(parents=True, exist_ok=True)
-
-    if dane_lista:
-        with p.open(mode="w", newline="", encoding="utf-8-sig") as plik_wyjsciowy:
-            writer = csv.DictWriter(plik_wyjsciowy, fieldnames=KOLUMNY_WYJ)
-            writer.writeheader()
-            writer.writerows(dane_lista)
-        print(f"\n✅ Zapisano {len(dane_lista)} ogłoszeń do pliku {p.resolve()} (po odfiltrowaniu pustych cen).")
+    if not dane_lista:
+        # upewnij się, że plik i arkusz istnieją z nagłówkiem
+        write_rows_to_single_xlsx(sheetname, [])
+        print(f"\n⚠️ Brak rekordów z ceną — utworzono/utrzymano arkusz z nagłówkiem w {SINGLE_XLSX.resolve()}.")
     else:
-        with p.open(mode="w", newline="", encoding="utf-8-sig") as plik_wyjsciowy:
-            writer = csv.DictWriter(plik_wyjsciowy, fieldnames=KOLUMNY_WYJ)
-            writer.writeheader()
-        print(f"\n⚠️ Brak rekordów z ceną — nadpisano plik {p.resolve()} samym nagłówkiem.")
+        write_rows_to_single_xlsx(sheetname, dane_lista)
+        print(f"\n✅ Zapisano {len}(dane_lista) ogłoszeń do {SINGLE_XLSX.resolve()} (arkusz: {sheetname}).")
 
-
+# ------------------------------ CLI ------------------------------
 if __name__ == "__main__":
-    przetworz_linki_z_intake_csv("intake.csv", "Baza_danych.xlsx")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--region", "-r", required=True, help="Slug województwa, np. 'mazowieckie'")
+    args = ap.parse_args()
+
+    slug = args.region.strip().lower()
+    input_csv = BASE_LINKI / f"intake_{slug}.csv"   # czytamy z Desktop/Pulpit/baza danych/linki
+    sheetname  = slug                                # zapisujemy do jednego pliku, arkusz = slug
+
+    if not input_csv.exists():
+        raise SystemExit(f"Nie znaleziono pliku linków: {input_csv}")
+
+    przetworz_linki_z_intake_csv_do_jednego_xlsx(input_csv, sheetname)

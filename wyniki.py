@@ -1,23 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-wyniki.py — kalkulator i zapis wyników do wybranego pliku Excel + sprawdzacz ilości ogłoszeń
-
-Nowości (ta wersja):
-- Wczytane z RAPORTU pola adresowe trafiają do **osobnych** zmiennych GUI
-  (Województwo, Powiat, Gmina, Miejscowość, Dzielnica, Ulica) i automatycznie
-  uzupełniają formularz „Adres do sprawdzenia”.
-- Przycisk „Sprawdź” liczy **hierarchicznie** liczbę ofert w bazie w wybranym zakresie
-  metrażu (Obszar ± tolerancja). Dla każdego poziomu (Woj→Pow→Gm→Msc→Dz→Ulica)
-  stosowane są wszystkie wcześniejsze filtry adresowe.
-
-Uruchomienie:
-  python wyniki.py [ŚCIEŻKA_DO_RAPORTU.xlsx] [ŚCIEŻKA_DO_BAZY.xlsx] [NAZWA_ARKUSZA_BAZY]
-
-Domyślnie:
-  Baza: ./Baza_danych.xlsx, arkusz „Mieszkania”.
-"""
-
 from __future__ import annotations
 
 import sys
@@ -28,43 +10,27 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
 import pandas as pd
-
-# pomocnicze formatowanie/statystyki
-import wyniki_matma as wm
-
+import wyniki_matma as wm  # pomocnicze formatowanie/statystyki
 
 # ====== Konfiguracja / stałe ======
 
-DEFAULT_DB_XLSX = "Baza_danych.xlsx"
-DEFAULT_DB_SHEET = "Mieszkania"
+def _default_db_path() -> Path:
+    # scalanie.py zapisuje tu: ~/Desktop/baza danych/Baza danych.xlsx
+    return Path.home() / "Desktop" / "baza danych" / "Baza danych.xlsx"
 
-COL_MEAN_M2 = "Średnia cena za m² (z bazy)"
-COL_EST_TOTAL = "Szacowana cena mieszkania"
-COL_NEG_15 = "Sugerowana cena negocjacyjna (−15%)"
-RESULT_COLS = [COL_MEAN_M2, COL_EST_TOTAL, COL_NEG_15]
+DEFAULT_DB_XLSX = _default_db_path()
+DEFAULT_DB_SHEET = "Polska"  # jeśli brak – wybierzemy pierwszy arkusz
+
+COL_MEAN_M2      = "Średnia cena za m² (z bazy)"                    # surowa średnia
+COL_MEAN_M2_ADJ  = "Średnia skorygowana cena za m² (z bazy)"        # po IQR
+COL_PROP_VALUE   = "Statystyczna wartość nieruchomości"             # skorygowana × metry
+RESULT_COLS = [COL_MEAN_M2, COL_MEAN_M2_ADJ, COL_PROP_VALUE]
 
 REQUIRED_REPORT_COLUMNS = [
-    "Nr KW",
-    "Typ Księgi",
-    "Stan Księgi",
-    "Województwo",
-    "Powiat",
-    "Gmina",
-    "Miejscowość",
-    "Dzielnica",
-    "Położenie",
-    "Nr działek po średniku",
-    "Obręb po średniku",
-    "Ulica",
-    "Sposób korzystania",
-    "Obszar",
-    "Ulica(dla budynku)",
-    "przeznaczenie (dla budynku)",
-    "Ulica(dla lokalu)",
-    "Nr budynku( dla lokalu)",
-    "Przeznaczenie (dla lokalu)",
-    "Cały adres (dla lokalu)",
-    "Czy udziały?",
+    "Nr KW","Typ Księgi","Stan Księgi","Województwo","Powiat","Gmina","Miejscowość","Dzielnica",
+    "Położenie","Nr działek po średniku","Obręb po średniku","Ulica","Sposób korzystania","Obszar",
+    "Ulica(dla budynku)","przeznaczenie (dla budynku)","Ulica(dla lokalu)","Nr budynku( dla lokalu)",
+    "Przeznaczenie (dla lokalu)","Cały adres (dla lokalu)","Czy udziały?",
 ]
 
 # mapowanie poziomów adresu: (etykieta_GUI, kolumna_w_bazie, kolumna_w_raporcie)
@@ -77,37 +43,54 @@ ADDRESS_LEVELS = [
     ("Ulica",        "ulica",       "Ulica"),
 ]
 
-
 # ====== I/O – wczytywanie bazy i raportu ======
+
+def _pick_sheet_safely(xlsx: Path, prefer: str | None = None) -> str:
+    xl = pd.ExcelFile(xlsx, engine="openpyxl")
+    if prefer and prefer in xl.sheet_names:
+        return prefer
+    # jeśli nie ma „Polska” – weź pierwszy arkusz
+    return xl.sheet_names[0]
 
 def load_db_excel(path: Path, sheet: str) -> pd.DataFrame:
     if not path.exists():
-        raise FileNotFoundError(f"Nie znaleziono bazy danych: {path}")
+        raise FileNotFoundError(
+            f"Nie znaleziono bazy danych: {path}\n"
+            "Upewnij się, że najpierw uruchomiłeś scalanie.py (Scalanie), "
+            "które tworzy plik 'Baza danych.xlsx' na Pulpicie."
+        )
 
-    df = pd.read_excel(path, sheet_name=sheet, engine="openpyxl")
+    # dobierz arkusz bezpiecznie (preferuj „Polska”)
+    try:
+        chosen_sheet = _pick_sheet_safely(path, prefer=sheet or DEFAULT_DB_SHEET)
+    except Exception as e:
+        raise RuntimeError(f"Nie udało się odczytać arkuszy z: {path}\n{e}")
+
+    df = pd.read_excel(path, sheet_name=chosen_sheet, engine="openpyxl")
+
     required = [
-        "cena", "cena_za_metr", "metry", "liczba_pokoi", "pietro", "rynek", "rok_budowy", "material",
-        "wojewodztwo", "powiat", "gmina", "miejscowosc", "dzielnica", "ulica", "link",
+        "cena","cena_za_metr","metry","liczba_pokoi","pietro","rynek","rok_budowy","material",
+        "wojewodztwo","powiat","gmina","miejscowosc","dzielnica","ulica","link",
     ]
     missing = [c for c in required if c not in df.columns]
     if missing:
-        raise ValueError("Brakuje kolumn w bazie: " + ", ".join(missing))
+        raise ValueError(
+            "Brakuje kolumn w bazie: " + ", ".join(missing) +
+            f"\nPlik: {path.name}, arkusz: {chosen_sheet}"
+        )
 
-    for num_col in ["cena_za_metr", "metry", "rok_budowy", "liczba_pokoi", "pietro"]:
+    # typy/liczby
+    for num_col in ["cena_za_metr","metry","rok_budowy","liczba_pokoi","pietro"]:
         df[num_col] = wm._coerce_numeric(df[num_col])  # type: ignore[attr-defined]
-    for txt_col in ["wojewodztwo", "powiat", "gmina", "miejscowosc", "dzielnica", "ulica"]:
+    for txt_col in ["wojewodztwo","powiat","gmina","miejscowosc","dzielnica","ulica"]:
         df[txt_col] = df[txt_col].astype(str)
 
     return df
 
-
 def _normalize_header_map(cols: List[str]) -> Dict[str, str]:
     def norm(s: str) -> str:
-        return (
-            str(s).strip().casefold().replace("  ", " ").replace("\u00a0", " ")
-        )
+        return str(s).strip().casefold().replace("  ", " ").replace("\u00a0", " ")
     return {norm(c): c for c in cols}
-
 
 def _pick_report_sheet(xlsx: Path) -> Tuple[str, pd.DataFrame]:
     xl = pd.ExcelFile(xlsx, engine="openpyxl")
@@ -125,24 +108,18 @@ def _pick_report_sheet(xlsx: Path) -> Tuple[str, pd.DataFrame]:
         raise ValueError("Nie znaleziono w raporcie arkusza z kolumną 'Nr KW'.")
     return best_name, best_df  # type: ignore[return-value]
 
-
 def ensure_report_columns_and_append_results(xlsx: Path, sheet: str) -> pd.DataFrame:
     df = pd.read_excel(xlsx, sheet_name=sheet, engine="openpyxl")
-
     for col in REQUIRED_REPORT_COLUMNS:
         if col not in df.columns:
             df[col] = ""
-
     existing = list(df.columns)
     rest = [c for c in existing if c not in REQUIRED_REPORT_COLUMNS and c not in RESULT_COLS]
     new_order = REQUIRED_REPORT_COLUMNS + RESULT_COLS + rest
     df = df.reindex(columns=new_order)
-
     with pd.ExcelWriter(xlsx, engine="openpyxl", mode="a", if_sheet_exists="replace") as wr:
         df.to_excel(wr, sheet_name=sheet, index=False)
-
     return df
-
 
 def _get_report_address_first_row(df: pd.DataFrame) -> Dict[str, str]:
     if df.empty:
@@ -154,7 +131,6 @@ def _get_report_address_first_row(df: pd.DataFrame) -> Dict[str, str]:
     for _, _, rp_key in ADDRESS_LEVELS:
         out[rp_key] = get(rp_key)
     return out
-
 
 # ====== Filtrowanie i liczenie ======
 
@@ -169,7 +145,6 @@ def _filter_db_by_level_and_area(
         center = float(str(area_center_str).replace(",", ".").replace(" ", ""))
     except Exception:
         center = float("nan")
-
     try:
         tol = float(str(tol_str).replace(",", ".").replace(" ", ""))
     except Exception:
@@ -188,20 +163,12 @@ def _filter_db_by_level_and_area(
     out = df_db[mask].copy()
     return out, center, lo, hi
 
-
 def count_offers_hierarchical(
     df_db: pd.DataFrame,
     area_center_str: str,
     tol_str: str,
-    values: Dict[str, str],  # klucze: etykiety raportowe (Województwo, Powiat, ...)
+    values: Dict[str, str],
 ) -> Dict[str, int]:
-    """Licz hierarchicznie:
-       - dla „Województwa” filtruj tylko woj + metraż
-       - dla „Powiatu” filtr: woj + pow + metraż
-       - ...
-       - dla „Ulicy” filtr: woj + pow + gm + msc + dz + ulica + metraż
-    """
-    # zakres metrażowy
     try:
         center = float(str(area_center_str).replace(",", ".").replace(" ", ""))
     except Exception:
@@ -220,7 +187,6 @@ def count_offers_hierarchical(
     base = df_db[m.between(lo, hi)].copy()
 
     counts: Dict[str, int] = {}
-    # filtruj narastająco
     current = base
     for human, db_key, rp_key in ADDRESS_LEVELS:
         val = (values.get(rp_key) or "").strip()
@@ -228,7 +194,6 @@ def count_offers_hierarchical(
             current = current[current[db_key].astype(str).str.casefold() == val.casefold()]
         counts[human] = int(len(current))
     return counts
-
 
 # ====== GUI ======
 
@@ -240,7 +205,8 @@ class Aplikacja(tk.Tk):
 
         # ścieżki
         self.report_path: Optional[Path] = Path(report_arg).expanduser() if report_arg else None
-        self.db_path: Optional[Path] = Path(db_arg).expanduser() if db_arg else Path(DEFAULT_DB_XLSX)
+        # domyślnie: scalony plik adresowy (Baza danych.xlsx / Polska)
+        self.db_path: Optional[Path] = Path(db_arg).expanduser() if db_arg else DEFAULT_DB_XLSX
         self.db_sheet: str = db_sheet_arg or DEFAULT_DB_SHEET
 
         # dane
@@ -271,19 +237,19 @@ class Aplikacja(tk.Tk):
 
         self._build_ui()
 
-        # auto-load jeśli podano argv
-        if self.report_path and self.report_path.exists():
-            self._load_report()
+        # auto-load jeśli podano argv, w innym wypadku spróbuj domyślny scalony plik
         if self.db_path and self.db_path.exists():
             self._load_db()
+        if self.report_path and self.report_path.exists():
+            self._load_report()
 
     # --- UI budowa ---
     def _build_ui(self):
         kontener = ttk.Frame(self, padding=12)
         kontener.pack(fill="both", expand=True)
 
-        # Baza danych
-        frm_db = ttk.LabelFrame(kontener, text="Baza danych (Excel)", padding=10)
+        # Baza danych (adresowa)
+        frm_db = ttk.LabelFrame(kontener, text="Baza adresowa (scalona) – Excel", padding=10)
         frm_db.pack(fill="x")
         ttk.Label(frm_db, text="Plik:").grid(row=0, column=0, sticky="w")
         ttk.Entry(frm_db, textvariable=self.var_db, width=70).grid(row=0, column=1, sticky="we", padx=6)
@@ -308,7 +274,7 @@ class Aplikacja(tk.Tk):
         ttk.Label(frm_calc, text="Poziom adresu:").grid(row=0, column=0, sticky="w")
         self.cmb_level = ttk.Combobox(
             frm_calc, width=20, state="readonly",
-            values=[name for (name, _, _) in ADDRESS_LEVELS[1:-0] if name != "Województwo"],  # najczęściej Msc/Dz/Ulica
+            values=[name for (name, _, _) in ADDRESS_LEVELS if name != "Województwo"],
             textvariable=self.var_level
         )
         self.cmb_level.grid(row=0, column=1, padx=(6, 12), sticky="w")
@@ -362,7 +328,8 @@ class Aplikacja(tk.Tk):
     # --- Handlery plików ---
     def _pick_db(self):
         p = filedialog.askopenfilename(
-            title="Wybierz plik bazy danych (Excel)",
+            title="Wybierz scalony plik bazy danych (Excel)",
+            initialdir=str(DEFAULT_DB_XLSX.parent),
             filetypes=[("Excel", "*.xlsx *.xlsm *.xls"), ("Wszystkie pliki", "*.*")]
         )
         if p:
@@ -397,12 +364,11 @@ class Aplikacja(tk.Tk):
             self.report_sheet = sheet
             self.df_report = df
 
-            # dane z pierwszego rekordu
             vals = _get_report_address_first_row(df)
             self.address_values = vals
             self.obszar = vals.get("Obszar", "")
 
-            # **AUTOUZUPEŁNIJ** formularz "Adres do sprawdzenia"
+            # autouzupełnij formularz
             self.var_woj.set(vals.get("Województwo", ""))
             self.var_pow.set(vals.get("Powiat", ""))
             self.var_gm.set(vals.get("Gmina", ""))
@@ -422,13 +388,12 @@ class Aplikacja(tk.Tk):
     # --- Kalkulacje i zapis ---
     def _run_calc(self):
         if self.df_db is None:
-            messagebox.showwarning("Brak bazy", "Wczytaj bazę danych (Excel).")
+            messagebox.showwarning("Brak bazy", "Wczytaj bazę danych (Excel) – scalony plik adresowy.")
             return
         if self.df_report is None or self.report_path is None or self.report_sheet is None:
             messagebox.showwarning("Brak raportu", "Wczytaj raport (Excel).")
             return
 
-        # poziom adresu do obliczeń (np. Miejscowość / Dzielnica / Ulica)
         mapping = {h: (db_key, rp_key) for (h, db_key, rp_key) in ADDRESS_LEVELS}
         human = self.var_level.get()
         if human not in mapping:
@@ -436,7 +401,6 @@ class Aplikacja(tk.Tk):
             return
         db_key, rp_key = mapping[human]
 
-        # używamy aktualnych pól formularza (a nie zafiksowanych wartości)
         current_values = {
             "Województwo": self.var_woj.get(),
             "Powiat": self.var_pow.get(),
@@ -451,33 +415,39 @@ class Aplikacja(tk.Tk):
             self.df_db, db_key, level_value, self.obszar, self.var_tol.get()
         )
 
+        self.txt.delete("1.0", "end")
+
         if df_filt.empty:
-            self.txt.delete("1.0", "end")
             self.txt.insert("end", f"Brak ofert w bazie dla: {human}='{level_value or '—'}' oraz metrażu w zakresie [{lo:.2f}, {hi:.2f}] m².\n")
-            self._write_results_to_report(mean_m2=None, est_total=None, neg15=None)
+            self._write_results_to_report(mean_raw_m2=None, mean_adj_m2=None, prop_value=None)
             return
 
+        # 1) ŚREDNIA SUROWA (bez IQR)
+        mean_raw_m2 = wm.mean_numeric(df_filt["cena_za_metr"])
+
+        # 2) ŚREDNIA SKORYGOWANA (po IQR)
         df_clean = wm.remove_outliers_iqr(df_filt.copy(), "cena_za_metr")
+        mean_adj_m2 = wm.mean_numeric(df_clean["cena_za_metr"])
+
         n_przed = len(df_filt)
         n_po = len(df_clean)
-        mean_m2 = float(df_clean["cena_za_metr"].mean()) if n_po else None
-        est_total = mean_m2 * center if (mean_m2 is not None and pd.notna(center)) else None
-        neg15 = est_total * 0.85 if est_total is not None else None
 
-        self._write_results_to_report(mean_m2=mean_m2, est_total=est_total, neg15=neg15)
+        # 3) WARTOŚĆ NIERUCHOMOŚCI = skorygowana średnia m2 × metry
+        prop_value = (mean_adj_m2 * center) if (mean_adj_m2 is not None and pd.notna(center)) else None
 
-        # pokaż w textboxie
-        self.txt.delete("1.0", "end")
+        self._write_results_to_report(mean_raw_m2=mean_raw_m2, mean_adj_m2=mean_adj_m2, prop_value=prop_value)
+
+        # prezentacja
         self.txt.insert("end", f"Poziom adresu do obliczeń: {human} = '{level_value or '—'}'\n")
         self.txt.insert("end", f"Zakres metrażu: {lo:.2f} — {hi:.2f} m²  (Obszar={center:.2f}, tol=±{float(self.var_tol.get() or 0):.2f})\n")
-        self.txt.insert("end", f"Liczba ofert w zakresie: {n_przed} (przed IQR), {n_po} po czyszczeniu IQR.\n")
-        self.txt.insert("end", f"Średnia cena za m²: {wm.format_price_per_m2(mean_m2)}\n")
-        self.txt.insert("end", f"Szacowana cena mieszkania (średnia×metry): {wm.format_currency(est_total)}\n")
-        self.txt.insert("end", f"Sugerowana cena negocjacyjna (−15%): {wm.format_currency(neg15)}\n\n")
+        self.txt.insert("end", f"Liczba ofert w zakresie: {n_przed} (przed IQR), {n_po} po czyszczeniu IQR.\n\n")
+        self.txt.insert("end", f"Średnia cena za m² (surowa): {wm.format_price_per_m2(mean_raw_m2)}\n")
+        self.txt.insert("end", f"Średnia skorygowana cena za m² (po IQR): {wm.format_price_per_m2(mean_adj_m2)}\n")
+        self.txt.insert("end", f"Statystyczna wartość nieruchomości: {wm.format_currency(prop_value)}\n\n")
         self.txt.insert("end", "Wyniki zapisane w raporcie (w 1. wierszu danych) w kolumnach:\n"
-                               f"  - {COL_MEAN_M2}\n  - {COL_EST_TOTAL}\n  - {COL_NEG_15}\n")
+                               f"  - {COL_MEAN_M2}\n  - {COL_MEAN_M2_ADJ}\n  - {COL_PROP_VALUE}\n")
 
-    def _write_results_to_report(self, mean_m2: Optional[float], est_total: Optional[float], neg15: Optional[float]):
+    def _write_results_to_report(self, mean_raw_m2: Optional[float], mean_adj_m2: Optional[float], prop_value: Optional[float]):
         if self.report_path is None or self.report_sheet is None:
             return
         rp = self.report_path
@@ -485,17 +455,17 @@ class Aplikacja(tk.Tk):
 
         df = ensure_report_columns_and_append_results(rp, sh)
 
-        s_mean = wm.format_price_per_m2(mean_m2) if mean_m2 is not None else "—"
-        s_est = wm.format_currency(est_total) if est_total is not None else "—"
-        s_neg = wm.format_currency(neg15) if neg15 is not None else "—"
+        s_mean_raw = wm.format_price_per_m2(mean_raw_m2) if mean_raw_m2 is not None else "—"
+        s_mean_adj = wm.format_price_per_m2(mean_adj_m2) if mean_adj_m2 is not None else "—"
+        s_prop_val = wm.format_currency(prop_value) if prop_value is not None else "—"
 
         if df.empty:
             df = pd.DataFrame(columns=df.columns)
             df.loc[0, :] = ""
 
-        df.loc[df.index[0], COL_MEAN_M2] = s_mean
-        df.loc[df.index[0], COL_EST_TOTAL] = s_est
-        df.loc[df.index[0], COL_NEG_15] = s_neg
+        df.loc[df.index[0], COL_MEAN_M2]     = s_mean_raw
+        df.loc[df.index[0], COL_MEAN_M2_ADJ] = s_mean_adj
+        df.loc[df.index[0], COL_PROP_VALUE]  = s_prop_val
 
         with pd.ExcelWriter(rp, engine="openpyxl", mode="a", if_sheet_exists="replace") as wr:
             df.to_excel(wr, sheet_name=sh, index=False)
@@ -503,7 +473,7 @@ class Aplikacja(tk.Tk):
     # --- Sprawdzacz ilości ogłoszeń ---
     def _on_sprawdz(self):
         if self.df_db is None:
-            messagebox.showwarning("Brak bazy", "Najpierw wczytaj bazę danych (Excel).")
+            messagebox.showwarning("Brak bazy", "Najpierw wczytaj scalony plik bazy danych (Excel).")
             return
         if not self.obszar:
             messagebox.showwarning("Brak metrażu", "Wczytaj raport, aby pobrać wartość „Obszar”.")

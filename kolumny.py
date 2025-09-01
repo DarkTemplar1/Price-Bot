@@ -25,6 +25,32 @@ VALUE_COLS: List[str] = [
 
 SUPPORTED = {".xlsx", ".xlsm"}
 
+# --------------------- NOWE: foldery na Pulpicie/Desktop ---------------------
+def _detect_desktop() -> Path:
+    """
+    Zwraca ścieżkę do Pulpitu/Desktop (obsługa PL/EN).
+    Jeśli nie istnieje, zwraca katalog domowy.
+    """
+    home = Path.home()
+    candidates = [home / "Desktop", home / "Pulpit"]
+    for c in candidates:
+        if c.exists():
+            return c
+    return home
+
+def ensure_base_dirs() -> Path:
+    """
+    Tworzy na Pulpicie/Desktop folder:
+      'baza danych' oraz podfoldery: 'linki', 'województwa'
+    Zwraca ścieżkę do folderu 'baza danych'.
+    """
+    desktop = _detect_desktop()
+    base = desktop / "baza danych"
+    (base / "linki").mkdir(parents=True, exist_ok=True)
+    (base / "województwa").mkdir(parents=True, exist_ok=True)
+    return base
+# ---------------------------------------------------------------------------
+
 def _ensure_base_headers(ws) -> None:
     # jeżeli pusty arkusz — wpisz od razu bazowe REQ_COLS
     if ws.max_row == 1 and ws.max_column == 1 and (ws.cell(1,1).value in (None, "")):
@@ -105,6 +131,14 @@ def error(msg: str) -> None:
         print("BŁĄD:", msg, file=sys.stderr)
 
 def main():
+    # 1) Utwórz strukturę katalogów na Pulpicie/Desktop
+    try:
+        base_dir = ensure_base_dirs()
+    except Exception as e:
+        error(f"Nie udało się utworzyć folderów na Pulpicie/Desktop:\n{e}")
+        raise SystemExit(3)
+
+    # 2) Wybór/obsługa pliku Excel
     if len(sys.argv) >= 2:
         xlsx_path = Path(sys.argv[1])
     else:
@@ -116,7 +150,14 @@ def main():
 
     try:
         ensure_sheet_and_columns(xlsx_path)
-        info(f"Przygotowano arkusze '{RAPORT_SHEET}' i '{RAPORT_ODF}' oraz dodano kolumny za 'Czy udziały?' w:\n{xlsx_path}")
+        info(
+            "Przygotowano arkusze 'raport' i 'raport_odfiltrowane' oraz dodano kolumny za 'Czy udziały?'\n"
+            f"Plik: {xlsx_path}\n\n"
+            "Utworzono/zweryfikowano również strukturę folderów na Pulpicie/Desktop:\n"
+            f"• {base_dir}\n"
+            f"• {base_dir/'linki'}\n"
+            f"• {base_dir/'województwa'}"
+        )
     except Exception as e:
         error(f"Nie udało się przygotować pliku:\n{e}")
         raise SystemExit(1)

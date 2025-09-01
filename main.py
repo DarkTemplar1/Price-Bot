@@ -206,20 +206,6 @@ def zbuduj_okno_glowne(sciezka_pliku: Path):
         command=lambda: uruchom_skrypt_subprocess(SCRIPT_DALEJ, nonlocal_sciezka[0]),
     )
     btn_dalej.grid(row=1, column=1, padx=6, pady=6)
-
-    tip = tk.Label(
-        ramka,
-        text=(
-            "Wskazówka: zacznij od „przygotowanie pliku”, aby dodać wymagane arkusze i kolumny.\n"
-            "Sortowanie i pozostałe operacje działają na aktualnie wskazanym pliku."
-        ),
-        fg="#555",
-        wraplength=580,
-        justify="left",
-        font=("Segoe UI", 9),
-    )
-    tip.pack(anchor="w", pady=(12, 0))
-
     root.mainloop()
 
 

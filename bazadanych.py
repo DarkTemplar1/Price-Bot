@@ -53,7 +53,7 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("680x430")
+        self.geometry("900x430")
         self.resizable(False, False)
 
         self.var_status = tk.StringVar(value="Wybierz kategorię i województwo, aby rozpocząć.")
@@ -115,7 +115,10 @@ class App(tk.Tk):
 
         controls = ttk.Frame(wrapper)
         controls.pack(fill="x", pady=(12, 0))
+
+        # NOWOŚĆ: przycisk „Scalanie” obok „Zamknij”
         ttk.Button(controls, text="Zamknij", command=self._safe_close).pack(side="right")
+        ttk.Button(controls, text="Scalanie", command=self._switch_to_scalanie).pack(side="right", padx=(0, 8))
 
     # ---------------- Pipeline ----------------
 
@@ -183,6 +186,34 @@ class App(tk.Tk):
             self.after(0, fn)
         except Exception:
             pass
+
+    # ---------------- Scalanie ----------------
+
+    def _switch_to_scalanie(self):
+        """
+        Uruchamia scalanie.py i zamyka bieżące okno (czyli „wyłącza” bazydanych.py).
+        Jeśli jakiś pipeline trwa, pyta o potwierdzenie przerwania.
+        """
+        if self._running_thread and self._running_thread.is_alive():
+            if not messagebox.askyesno(
+                "Wciąż trwa",
+                "Proces jeszcze działa. Przerwać i przejść do Scalanie?"
+            ):
+                return
+
+        scal_path = _resolve_script("scalanie.py")
+        if scal_path is None:
+            messagebox.showerror("Brak pliku", "Nie znaleziono pliku scalanie.py w katalogu aplikacji.")
+            return
+
+        try:
+            subprocess.Popen([PYTHON, str(scal_path)])
+        except Exception as e:
+            messagebox.showerror("Błąd uruchamiania", f"Nie udało się uruchomić scalanie.py:\n{e}")
+            return
+
+        # zamknij to okno/aplikację
+        self.destroy()
 
     # ---------------- Lifecycle ----------------
 
