@@ -16,7 +16,6 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
-from openpyxl import Workbook, load_workbook
 
 # ------------------------------ WYJŚCIE: Desktop/Pulpit ------------------------------
 def _detect_desktop() -> Path:
@@ -28,13 +27,10 @@ def _detect_desktop() -> Path:
     return home
 
 BASE_BAZA = _detect_desktop() / "baza danych"
-BASE_LINKI = BASE_BAZA / "linki"
-BASE_WOJ   = BASE_BAZA / "województwa"
-BASE_LINKI.mkdir(parents=True, exist_ok=True)
-BASE_WOJ.mkdir(parents=True, exist_ok=True)
-
-# jeden wspólny plik dla wszystkich województw:
-SINGLE_XLSX = BASE_WOJ / "wojewodztwa.xlsx"
+BASE_LINKI_DIR = BASE_BAZA / "linki"            # katalog z plikami {slug}.csv
+BASE_WOJ_DIR = BASE_BAZA / "województwa"        # wynik: {slug}.csv
+BASE_LINKI_DIR.mkdir(parents=True, exist_ok=True)
+BASE_WOJ_DIR.mkdir(parents=True, exist_ok=True)
 # -------------------------------------------------------------------------------------
 
 from adres_otodom import (
@@ -49,6 +45,11 @@ from adres_otodom import (
 CONTACT_EMAIL = "twoj_email@domena.pl"
 WAIT_SECONDS = 20
 set_contact_email(CONTACT_EMAIL)
+
+KOLUMNY_WYJ = [
+    "cena","cena_za_metr","metry","liczba_pokoi","pietro","rynek","rok_budowy","material",
+    "wojewodztwo","powiat","gmina","miejscowosc","dzielnica","ulica","link",
+]
 
 szukane_pola = {
     "Cena": "cena",
@@ -68,24 +69,6 @@ LABEL_SYNONYMS = {
     "Materiał budynku": ("material", ["Materiał budynku", "Materiał", "Materiał bud."]),
     "Piętro": ("pietro", ["Piętro", "Kondygnacja", "Poziom"]),
 }
-
-KOLUMNY_WYJ = [
-    "cena",
-    "cena_za_metr",
-    "metry",
-    "liczba_pokoi",
-    "pietro",
-    "rynek",
-    "rok_budowy",
-    "material",
-    "wojewodztwo",
-    "powiat",
-    "gmina",
-    "miejscowosc",
-    "dzielnica",
-    "ulica",
-    "link",
-]
 
 def format_pln_int(x) -> str | None:
     if x is None:
@@ -124,41 +107,6 @@ def oblicz_cena_za_metr(cena_str: str, metry_str: str) -> str:
 
 def _norm_txt(s: str | None) -> str:
     return re.sub(r"\s+", " ", (s or "").replace("\xa0", " ")).strip()
-
-def _extract_by_labels_generic(soup, wynik: dict):
-    labels = []
-    label_to_key = {}
-    for _canon, (key, syns) in LABEL_SYNONYMS.items():
-        for s in syns:
-            labels.append(re.escape(s))
-            label_to_key[s.lower()] = key
-    if not labels:
-        return
-    pat = re.compile(rf"^(?:{'|'.join(labels)})\s*:?\s*$", re.I)
-    for node in soup.find_all(string=pat):
-        lab_raw = _norm_txt(node)
-        lab = re.sub(r":$", "", lab_raw, flags=re.I)
-        key = label_to_key.get(lab.lower())
-        if not key or wynik.get(key):
-            continue
-        val = None
-        parent = node.parent
-        for cand in (
-            getattr(parent, "next_sibling", None),
-            getattr(parent, "find_next_sibling", lambda: None)(),
-            getattr(parent.parent if parent else None, "find_next_sibling", lambda: None)(),
-        ):
-            if hasattr(cand, "get_text"):
-                t = _norm_txt(cand.get_text(" ", strip=True))
-                if t and t.lower() != lab.lower():
-                    val = t
-                    break
-        if not val:
-            nxt = node.find_next(string=lambda t: _norm_txt(t) and _norm_txt(t).lower() != lab.lower())
-            if nxt:
-                val = _norm_txt(nxt)
-        if val:
-            wynik[key] = val
 
 _REMOTE_CLOSED_MARKERS = (
     "remote end closed connection without response",
@@ -370,25 +318,41 @@ def pobierz_dane_z_otodom(url: str) -> dict:
             if label in szukane_pola and szukane_pola[label] not in wynik:
                 wynik[szukane_pola[label]] = value
 
-    _extract_by_labels_generic(soup, wynik)
-
-    try:
-        for s in soup.find_all("script", attrs={"type": "application/ld+json"}):
-            raw = (s.string or "").strip()
-            if not raw:
+    # generik
+    labels = []
+    label_to_key = {}
+    for _canon, (key, syns) in LABEL_SYNONYMS.items():
+        for s in syns:
+            labels.append(re.escape(s))
+            label_to_key[s.lower()] = key
+    if labels:
+        pat = re.compile(rf"^(?:{'|'.join(labels)})\s*:?\s*$", re.I)
+        for node in soup.find_all(string=pat):
+            lab_raw = _norm_txt(node)
+            lab = re.sub(r":$", "", lab_raw, flags=re.I)
+            key = label_to_key.get(lab.lower())
+            if not key or wynik.get(key):
                 continue
-            try:
-                data = json.loads(raw)
-                _fill_from_jsonld(data, wynik)
-            except Exception:
-                try:
-                    data = json.loads(raw.replace("\n", " ").replace("\t", " "))
-                    _fill_from_jsonld(data, wynik)
-                except Exception:
-                    pass
-    except Exception:
-        pass
+            val = None
+            parent = node.parent
+            for cand in (
+                getattr(parent, "next_sibling", None),
+                getattr(parent, "find_next_sibling", lambda: None)(),
+                getattr(parent.parent if parent else None, "find_next_sibling", lambda: None)(),
+            ):
+                if hasattr(cand, "get_text"):
+                    t = _norm_txt(cand.get_text(" ", strip=True))
+                    if t and t.lower() != lab.lower():
+                        val = t
+                        break
+            if not val:
+                nxt = node.find_next(string=lambda t: _norm_txt(t) and _norm_txt(t).lower() != lab.lower())
+                if nxt:
+                    val = _norm_txt(nxt)
+            if val:
+                wynik[key] = val
 
+    # adres
     adres_string = _wyciagnij_adres_string(soup)
     adr_jsonld_str = _address_from_jsonld(soup)
     if adr_jsonld_str and len(adr_jsonld_str) > len(adres_string):
@@ -456,74 +420,88 @@ def pobierz_dane_z_otodom(url: str) -> dict:
     _consistency_pass_row(out)
     return out
 
-# ============== ZAPIS DO JEDNEGO EXCELA (osobne arkusze) ==============
-def _ensure_sheet_with_header(wb, sheetname: str, headers: list[str]):
-    if sheetname in wb.sheetnames:
-        ws = wb[sheetname]
-        if ws.max_row < 1 or all((c.value in (None, "")) for c in ws[1]):
-            for i, h in enumerate(headers, start=1):
-                ws.cell(row=1, column=i, value=h)
-        return ws
-    ws = wb.create_sheet(title=sheetname)
-    for i, h in enumerate(headers, start=1):
-        ws.cell(row=1, column=i, value=h)
-    return ws
+# ------------------------------ CSV I/O ------------------------------
+def _canon_slug(slug: str) -> str:
+    return slug.replace("--", "-").strip().lower()
 
-def write_rows_to_single_xlsx(sheetname: str, rows: list[dict]):
-    if SINGLE_XLSX.exists():
-        wb = load_workbook(SINGLE_XLSX)
-    else:
-        wb = Workbook()
-        if "Sheet" in wb.sheetnames and len(wb.sheetnames) == 1:
-            wb.remove(wb["Sheet"])
+def _alt_slugs(slug: str) -> list[str]:
+    s = slug.strip().lower()
+    return list(dict.fromkeys([s, s.replace("--", "-"), s.replace("-", "--")]))
 
-    ws = _ensure_sheet_with_header(wb, sheetname, KOLUMNY_WYJ)
+def _find_links_csv(slug: str) -> Path | None:
+    candidates = []
+    for s in _alt_slugs(slug):
+        candidates.append(BASE_LINKI_DIR / f"{s}.csv")
+        candidates.append(BASE_LINKI_DIR / f"intake_{s}.csv")  # legacy
+    for p in candidates:
+        if p.exists() and p.stat().st_size > 0:
+            return p
+    return None
 
-    for row in rows:
-        ws.append([row.get(col, "") for col in KOLUMNY_WYJ])
-
-    SINGLE_XLSX.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(SINGLE_XLSX)
-
-# ============== PIPE: czytaj linki (CSV) -> scrap -> JEDEN XLSX ==============
-def przetworz_linki_z_intake_csv_do_jednego_xlsx(input_csv: Path, sheetname: str):
-    dane_lista = []
-    with input_csv.open(mode="r", encoding="utf-8") as plik_wejsciowy:
-        reader = csv.reader(plik_wejsciowy)
-        next(reader, None)  # nagłówek
-        for row in reader:
-            if not row or not row[0].strip():
+def _read_links_from_csv(path: Path) -> list[str]:
+    links = []
+    with path.open("r", newline="", encoding="utf-8") as f:
+        r = csv.reader(f)
+        header = next(r, None)
+        has_header = bool(header and ("link" in [c.strip().lower() for c in header]))
+        if not has_header and header and header[0].strip():
+            links.append(header[0].strip())
+        for row in r:
+            if not row:
                 continue
-            link = row[0].strip()
-            print(f"\n🌐 Przetwarzam link: {link}")
-            dane = None
-            for attempt in range(2):
-                try:
-                    dane = pobierz_dane_z_otodom(link)
-                    break
-                except Exception as e:
-                    if _is_remote_closed(e) and attempt == 0:
-                        print(f"[WARN] Tymczasowy problem sieciowy: {e} — ponawiam…")
-                        time.sleep(2.0)
-                        continue
-                    print(f"❌ Błąd przy linku {link}: {e}")
-                    dane = None
-                    break
-            if not dane:
-                continue
-            for k in KOLUMNY_WYJ:
-                dane.setdefault(k, "")
+            u = (row[0] or "").strip()
+            if u:
+                links.append(u)
+    return links
+
+def _append_rows_to_output_csv(output_csv: Path, rows: list[dict]):
+    write_header = not output_csv.exists() or output_csv.stat().st_size == 0
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    with output_csv.open("a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if write_header:
+            w.writerow(KOLUMNY_WYJ)
+        for r in rows:
+            w.writerow([r.get(col, "") for col in KOLUMNY_WYJ])
+
+# ------------------------------ PIPE ------------------------------
+def przetworz_linki_do_csv(input_csv: Path, out_csv: Path):
+    try:
+        links = _read_links_from_csv(input_csv)
+    except Exception as e:
+        raise SystemExit(f"Nie mogę odczytać linków z {input_csv}: {e}")
+
+    print(f"[INFO] Do przetworzenia linków: {len(links)}")
+    if not links:
+        print("[INFO] Brak linków w pliku — nic do zrobienia.")
+        _append_rows_to_output_csv(out_csv, [])
+        return
+
+    dane_lista: list[dict] = []
+    for i, link in enumerate(links, start=1):
+        print(f"\n🌐 [{i}/{len(links)}] {link}")
+        dane = None
+        for attempt in range(2):
+            try:
+                dane = pobierz_dane_z_otodom(link)
+                break
+            except Exception as e:
+                if _is_remote_closed(e) and attempt == 0:
+                    print(f"[WARN] Problem sieciowy: {e} — ponawiam…")
+                    time.sleep(2.0)
+                    continue
+                print(f"❌ Błąd przy linku: {e}")
+                dane = None
+                break
+        if not dane:
+            continue
+        for k in KOLUMNY_WYJ:
+            dane.setdefault(k, "")
+        if (dane.get("cena") or "").strip():
             dane_lista.append(dane)
 
-    dane_lista = [r for r in dane_lista if (r.get("cena") or "").strip()]
-
-    if not dane_lista:
-        # upewnij się, że plik i arkusz istnieją z nagłówkiem
-        write_rows_to_single_xlsx(sheetname, [])
-        print(f"\n⚠️ Brak rekordów z ceną — utworzono/utrzymano arkusz z nagłówkiem w {SINGLE_XLSX.resolve()}.")
-    else:
-        write_rows_to_single_xlsx(sheetname, dane_lista)
-        print(f"\n✅ Zapisano {len}(dane_lista) ogłoszeń do {SINGLE_XLSX.resolve()} (arkusz: {sheetname}).")
+    _append_rows_to_output_csv(out_csv, dane_lista)
+    print(f"\n✅ Zapisano {len(dane_lista)} rekordów do {out_csv}")
 
 # ------------------------------ CLI ------------------------------
 if __name__ == "__main__":
@@ -531,11 +509,19 @@ if __name__ == "__main__":
     ap.add_argument("--region", "-r", required=True, help="Slug województwa, np. 'mazowieckie'")
     args = ap.parse_args()
 
-    slug = args.region.strip().lower()
-    input_csv = BASE_LINKI / f"intake_{slug}.csv"   # czytamy z Desktop/Pulpit/baza danych/linki
-    sheetname  = slug                                # zapisujemy do jednego pliku, arkusz = slug
+    slug_in = args.region.strip().lower()
+    input_csv = _find_links_csv(slug_in)
+    if not input_csv:
+        raise SystemExit(
+            "Nie znaleziono pliku z linkami.\n"
+            f"Szukane warianty: {', '.join(str(BASE_LINKI_DIR / (s + '.csv')) for s in _alt_slugs(slug_in))} "
+            f"oraz intake_*.csv"
+        )
 
-    if not input_csv.exists():
-        raise SystemExit(f"Nie znaleziono pliku linków: {input_csv}")
+    slug_out = _canon_slug(slug_in)
+    out_csv = BASE_WOJ_DIR / f"{slug_out}.csv"
 
-    przetworz_linki_z_intake_csv_do_jednego_xlsx(input_csv, sheetname)
+    print(f"[INFO] Czytam linki z: {input_csv}")
+    print(f"[INFO] Zapis wyników do: {out_csv}")
+
+    przetworz_linki_do_csv(input_csv, out_csv)

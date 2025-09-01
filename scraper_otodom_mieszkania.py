@@ -1,397 +1,492 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from __future__ import annotations
+
 import argparse
 import csv
 import json
 import re
 import time
-import unicodedata
+from http.client import RemoteDisconnected
 from pathlib import Path
-from typing import Iterable, List, Optional
-from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
-import requests
+
 from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 
-# --- (opcjonalnie) Selenium - nie używamy domyślnie ---
-try:
-    import undetected_chromedriver as uc  # noqa: F401
-    from selenium.webdriver.common.by import By  # noqa: F401
-    from selenium.webdriver.support.ui import WebDriverWait  # noqa: F401
-    from selenium.webdriver.support import expected_conditions as EC  # noqa: F401
-    _SELENIUM_AVAILABLE = True
-except Exception:
-    _SELENIUM_AVAILABLE = False
+print("[SCRAPER] Uruchomiono scraper_otodom_mieszkania.py")
 
-from datetime import datetime
-try:
-    from zoneinfo import ZoneInfo  # Python 3.9+
-    _TZ = ZoneInfo("Europe/Warsaw")
-except Exception:
-    _TZ = None
+# ------------------------------ ŚCIEŻKI ------------------------------
+def _detect_desktop() -> Path:
+    home = Path.home()
+    for name in ("Desktop", "Pulpit"):
+        p = home / name
+        if p.exists():
+            return p
+    return home
 
-from secrets import SystemRandom
-_RNG = SystemRandom()
+BASE_BAZA = _detect_desktop() / "baza danych"
+BASE_LINKI_DIR = BASE_BAZA / "linki"
+BASE_WOJ_DIR   = BASE_BAZA / "województwa"
+BASE_LINKI_DIR.mkdir(parents=True, exist_ok=True)
+BASE_WOJ_DIR.mkdir(parents=True, exist_ok=True)
 
-BASE_DIR = Path(__file__).resolve().parent
-
+# ------------------------------ KONFIG ------------------------------
+CONTACT_EMAIL = "twoj_email@domena.pl"
 WAIT_SECONDS = 20
-RETRIES_NAV = 3
-USE_SELENIUM = False  # domyślnie bez przeglądarki
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+KOLUMNY_WYJ = [
+    "cena","cena_za_metr","metry","liczba_pokoi","pietro","rynek","rok_budowy","material",
+    "wojewodztwo","powiat","gmina","miejscowosc","dzielnica","ulica","link",
+]
+
+szukane_pola = {
+    "Cena": "cena",
+    "Cena za m²": "cena_za_metr",
+    "Powierzchnia": "metry",
+    "Liczba pokoi": "liczba_pokoi",
+    "Piętro": "pietro",
+    "Rynek": "rynek",
+    "Rok budowy": "rok_budowy",
+    "Materiał budynku": "material",
+}
+
+LABEL_SYNONYMS = {
+    "Liczba pokoi": ("liczba_pokoi", ["Liczba pokoi"]),
+    "Rynek": ("rynek", ["Rynek", "Typ rynku"]),
+    "Rok budowy": ("rok_budowy", ["Rok budowy", "Rok bud."]),
+    "Materiał budynku": ("material", ["Materiał budynku", "Materiał", "Materiał bud."]),
+    "Piętro": ("pietro", ["Piętro", "Kondygnacja", "Poziom"]),
+}
+
+from adres_otodom import (
+    set_contact_email,
+    parsuj_adres_string,
+    uzupelnij_braki_z_nominatim,
+    dopelnij_powiat_gmina_jesli_brak,
+    _clean_gmina,
+    _consistency_pass_row,
 )
 
-# Kolejność ustalona, by raport był przewidywalny
-VOIVODESHIPS_ORDERED: List[tuple[str, str]] = [
-    ("dolnoslaskie", "Dolnośląskie"),
-    ("kujawsko-pomorskie", "Kujawsko-Pomorskie"),
-    ("lubelskie", "Lubelskie"),
-    ("lubuskie", "Lubuskie"),
-    ("lodzkie", "Łódzkie"),
-    ("malopolskie", "Małopolskie"),
-    ("mazowieckie", "Mazowieckie"),
-    ("opolskie", "Opolskie"),
-    ("podkarpackie", "Podkarpackie"),
-    ("podlaskie", "Podlaskie"),
-    ("pomorskie", "Pomorskie"),
-    ("slaskie", "Śląskie"),
-    ("swietokrzyskie", "Świętokrzyskie"),
-    ("warminsko-mazurskie", "Warmińsko-Mazurskie"),
-    ("wielkopolskie", "Wielkopolskie"),
-    ("zachodniopomorskie", "Zachodniopomorskie"),
+set_contact_email(CONTACT_EMAIL)
+
+def format_pln_int(x) -> str | None:
+    if x is None: return None
+    try: return f"{int(x):,} zł".replace(",", " ")
+    except Exception: return None
+
+def fmt_metry(value) -> str | None:
+    if value is None: return None
+    try:
+        v = float(str(value).replace(",", "."))
+        s = f"{v:.2f}".rstrip("0").rstrip(".").replace(".", ",")
+        return f"{s} m²"
+    except Exception:
+        return None
+
+def _num(s: str):
+    if not s: return None
+    digits = re.sub(r"[^\d]", "", s)
+    return int(digits) if digits else None
+
+def oblicz_cena_za_metr(cena_str: str, metry_str: str) -> str:
+    try:
+        cena = int(re.sub(r"[^\d]", "", cena_str or ""))
+        metry = float((metry_str or "").replace(",", ".").replace("m²", "").strip())
+        if not cena or not metry: return ""
+        return f"{round(cena / metry)} zł/m²"
+    except Exception:
+        return ""
+
+def _norm_txt(s: str | None) -> str:
+    return re.sub(r"\s+", " ", (s or "").replace("\xa0", " ")).strip()
+
+def _is_remote_closed(exc: Exception) -> bool:
+    s = (str(exc) or "").lower()
+    if isinstance(exc, RemoteDisconnected): return True
+    return any(m in s for m in (
+        "remote end closed connection without response",
+        "remotedisconnected",
+        "connection reset",
+        "chunked encoding",
+    ))
+
+def _safe_enrich_address(adr: dict, tries: int = 5, base_sleep: float = 1.2) -> dict:
+    cur = dict(adr or {})
+    for i in range(tries):
+        try:
+            cur = uzupelnij_braki_z_nominatim(cur)
+            cur = dopelnij_powiat_gmina_jesli_brak(cur)
+            return cur
+        except Exception as e:
+            if _is_remote_closed(e):
+                time.sleep(base_sleep * (i + 1))
+                continue
+            raise
+    print("[WARN] Nominatim: zrezygnowano po wielokrotnych próbach")
+    return cur
+
+PRICE_SELECTORS = [
+    "strong[data-testid='ad-price']",
+    "[data-testid='ad-price']",
+    "[data-cy='ad-price']",
 ]
-VOIVODESHIPS = dict(VOIVODESHIPS_ORDERED)
-DEFAULT_REGION = "all"  # <- teraz domyślnie wszystkie
+def _extract_price_from_dom(soup, wynik: dict):
+    for sel in PRICE_SELECTORS:
+        el = soup.select_one(sel)
+        if el:
+            txt = _norm_txt(el.get_text(" ", strip=True))
+            if txt:
+                wynik["cena"] = txt
+                return
 
-# ------------------------------ Utils ------------------------------
-def _slugify_region_input(raw: str) -> List[str]:
-    """
-    Przyjmuje:
-      - 'all'  → wszystkie slugi
-      - pojedynczy slug lub etykietę ('mazowieckie' / 'Mazowieckie')
-      - listę po przecinku ('mazowieckie,slaskie' lub 'Mazowieckie, Śląskie')
-    Zwraca listę SLUGÓW.
-    """
-    if not raw or raw.strip().lower() == "all":
-        return [slug for slug, _ in VOIVODESHIPS_ORDERED]
-
-    label_to_slug = {v.lower(): k for k, v in VOIVODESHIPS.items()}
-
-    out: List[str] = []
-    for part in raw.split(","):
-        s = part.strip().lower()
-        if not s:
-            continue
-        if s in VOIVODESHIPS:
-            out.append(s)
-        else:
-            slug = label_to_slug.get(s)
-            if slug:
-                out.append(slug)
-            else:
-                out.append(s)
-    # walidacja
-    bad = [s for s in out if s not in VOIVODESHIPS]
-    if bad:
-        valid = ", ".join(VOIVODESHIPS.keys())
-        raise SystemExit(
-            f"Nieznane województwo/slug: {', '.join(bad)}\n"
-            f"Dozwolone slugi: {valid}\n"
-            f"Albo użyj: --region all"
-        )
-    # deduplikacja z zachowaniem kolejności
-    seen = set()
-    uniq = []
-    for s in out:
-        if s not in seen:
-            uniq.append(s)
-            seen.add(s)
-    return uniq
-
-
-def add_or_replace_query_param(url: str, key: str, value: str) -> str:
-    parts = list(urlparse(url))
-    q = parse_qs(parts[4], keep_blank_values=True)
-    q[key] = [str(value)]
-    parts[4] = urlencode(q, doseq=True)
-    return urlunparse(parts)
-
-def _strip_accents(text: str) -> str:
-    return "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
-
-# Ekstrakcja stabilnego klucza oferty (ID); fallback: znormalizowany URL
-_ID_RE = re.compile(r"/pl/oferta/[^/]*-(\d{5,})")
-
-def _offer_key(url: str) -> str:
-    m = _ID_RE.search(url)
-    return m.group(1) if m else url.rstrip("/")
-
-# ------------------------------ Parsowanie ------------------------------
-def parse_links_from_html(html: str, base_url: str) -> set[str]:
-    """
-    Zwraca zestaw linków do ofert /pl/oferta/ z listingu.
-    Rozszerzony selektor + JSON-LD. Normalizuje URL (bez query/fragmentu, bez trailing slash).
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    links: set[str] = set()
-
-    # Różne warianty markupu + fallback
-    for a in soup.select(
-        'a[data-cy="listing-item-link"][href], '
-        'a[data-testid="listing-item-link"][href], '
-        'a[href*="/pl/oferta/"]'
-    ):
-        href = (a.get("href") or "").strip()
-        if not href:
-            continue
-        full = urljoin(base_url, href.split("?")[0].split("#")[0]).rstrip("/")
-        if "/pl/oferta/" in full:
-            links.add(full)
-
-    # JSON-LD (dodatkowe źródło)
-    for script in soup.find_all("script", {"type": "application/ld+json"}):
-        raw = script.string or ""
-        if not raw.strip():
-            continue
+def _address_from_jsonld(soup) -> str:
+    for s in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        raw = (s.string or "").strip()
+        if not raw: continue
         try:
             data = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-
-        def walk(node):
-            if isinstance(node, dict):
-                if node.get("@type") == "Product":
-                    offers = node.get("offers")
-                    if isinstance(offers, dict):
-                        inner = offers.get("offers")
-                        if isinstance(inner, list):
-                            for it in inner:
-                                u = (it or {}).get("url")
-                                if isinstance(u, str) and "/pl/oferta/" in u:
-                                    full2 = urljoin(base_url, u.split("?")[0].split("#")[0]).rstrip("/")
-                                    links.add(full2)
-                for v in node.values():
-                    walk(v)
-            elif isinstance(node, list):
-                for v in node:
-                    walk(v)
-
-        walk(data)
-    return links
-
-# ------------------------------ FETCHERS ------------------------------
-class HttpFetcher:
-    def __init__(self, wait_seconds: int = WAIT_SECONDS):
-        self.sess = requests.Session()
-        self.sess.headers.update(
-            {
-                "User-Agent": USER_AGENT,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Connection": "keep-alive",
-            }
-        )
-        self.timeout = wait_seconds
-        self._html = ""
-        self._url = ""
-
-    def get(self, url: str) -> bool:
-        last_err = None
-        for attempt in range(RETRIES_NAV):
+        except Exception:
             try:
-                r = self.sess.get(url, timeout=self.timeout)
-                if r.status_code >= 400:
-                    raise requests.HTTPError(f"{r.status_code}")
-                self._html = r.text
-                self._url = r.url
-                return True
-            except Exception as e:
-                last_err = e
-                time.sleep(1.25 * (attempt + 1))
-        print(f"[WARN] Nie udało się wczytać: {url} ({last_err})")
-        return False
+                data = json.loads(raw.replace("\n", " ").replace("\t", " "))
+            except Exception:
+                continue
+        items = data if isinstance(data, list) else [data]
+        for it in items:
+            addr = it.get("address")
+            if isinstance(addr, dict):
+                parts = []
+                street = addr.get("streetAddress")
+                locality = addr.get("addressLocality") or addr.get("addressRegion")
+                country = addr.get("addressCountry")
+                if street: parts.append(_norm_txt(street))
+                if locality: parts.append(_norm_txt(locality))
+                if country: parts.append(country if isinstance(country, str) else _norm_txt(country.get("name", "")))
+                s = ", ".join([p for p in parts if p])
+                if s: return s
+    return ""
 
-    def page_source(self) -> str:
-        return self._html
+def _pobierz_soup(url: str):
+    opts = Options()
+    opts.add_argument("--start-maximized")
+    # opts.add_argument("--headless=new")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
 
-    def current_url(self) -> str:
-        return self._url or ""
-
-    def close(self):
+    driver = webdriver.Chrome(options=opts)
+    try:
         try:
-            self.sess.close()
+            driver.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {"source": "Object.defineProperty(navigator,'webdriver',{get:() => undefined})"},
+            )
         except Exception:
             pass
 
-def _make_fetcher():
-    return HttpFetcher(wait_seconds=WAIT_SECONDS)
-
-# ------------------------------ Core ------------------------------
-def collect_links_all_pages(
-    search_url: str,
-    min_delay: float = 1.5,
-    max_delay: float = 5.0,
-    stop_after_k_empty_pages: int = 25,
-    max_pages: Optional[int] = None,  # None = bez limitu stron
-) -> list[str]:
-    """
-    Iteruje po stronach 1..N aż do wyczerpania wyników.
-    - Toleruje do 'stop_after_k_empty_pages' kolejnych stron bez nowych ofert (duplikaty/promowane).
-    - Dedupikacja po stabilnym kluczu oferty (ID) – odporna na zmiany tytułu/slug-a w URL.
-    - 'max_pages=None' oznacza brak twardego limitu liczby stron.
-    """
-    fetcher = _make_fetcher()
-    seen_keys, out = set(), []
-    page = 1
-    empty_streak = 0
-    try:
-        while True:
-            if isinstance(max_pages, int) and page > max_pages:
-                print(f"[INFO] Osiągnięto limit {max_pages} stron – koniec.")
+        last_err = None
+        for attempt in range(3):
+            try:
+                driver.get(url)
                 break
+            except Exception as e:
+                last_err = e
+                time.sleep(1.5 * (attempt + 1))
+        if last_err and attempt == 2:
+            raise last_err
 
-            url = search_url if page == 1 else add_or_replace_query_param(search_url, "page", page)
-            ok = fetcher.get(url)
-            if not ok:
-                if page == 1:
-                    print(f"[ERR] Nie udało się pobrać pierwszej strony: {url}")
-                break
+        wait = WebDriverWait(driver, WAIT_SECONDS)
+        try:
+            wait.until(
+                EC.any_of(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "meta[name='description']")),
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "strong[data-testid='ad-price']")),
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "link[rel='canonical']")),
+                )
+            )
+        except Exception:
+            time.sleep(min(5, WAIT_SECONDS))
 
-            html = fetcher.page_source()
-            base_url = fetcher.current_url() or search_url
-            links = parse_links_from_html(html, base_url)
-
-            if not links:
-                print(f"[INFO] Strona {page}: brak jakichkolwiek linków – koniec.")
-                break
-
-            new_links = []
-            for u in links:
-                k = _offer_key(u)
-                if k not in seen_keys:
-                    seen_keys.add(k)
-                    new_links.append(u)
-
-            if new_links:
-                out.extend(new_links)
-                empty_streak = 0
-                print(f"[INFO] Strona {page}: {len(new_links)} nowych (łącznie {len(out)}).")
-            else:
-                empty_streak += 1
-                print(f"[INFO] Strona {page}: 0 nowych (seria {empty_streak}/{stop_after_k_empty_pages}).")
-                if empty_streak >= stop_after_k_empty_pages:
-                    print("[INFO] Zbyt wiele stron bez nowych ofert – przerywam.")
-                    break
-
-            page += 1
-            time.sleep(_RNG.uniform(min_delay, max_delay))
+        html = driver.page_source
     finally:
-        fetcher.close()
+        driver.quit()
+    return BeautifulSoup(html, "html.parser")
+
+def _wyciagnij_adres_string(soup) -> str:
+    mapa_link = soup.select_one("a[href='#map']") or soup.select_one("a[href*='mapa']") \
+        or soup.find("span", attrs={"data-cy": "adPageAdLocalisation"})
+    if mapa_link:
+        t = mapa_link.get_text(strip=True)
+        print("📍 Adres z UI:", t)
+        return t
+    return ""
+
+def _fill_from_jsonld(obj, wynik: dict):
+    if not isinstance(obj, (dict, list)): return
+    items = obj if isinstance(obj, list) else [obj]
+    for it in items:
+        if not isinstance(it, dict): continue
+        offers = it.get("offers") or it.get("offer")
+        if isinstance(offers, dict):
+            if "cena" not in wynik and offers.get("price"):
+                wynik["cena"] = format_pln_int(offers.get("price")) or wynik.get("cena")
+        floor_size = it.get("floorSize") or it.get("floorArea")
+        if isinstance(floor_size, dict) and "metry" not in wynik:
+            v = floor_size.get("value") or it.get("valueReference")
+            m2 = fmt_metry(v)
+            if m2: wynik["metry"] = m2
+        if "liczba_pokoi" not in wynik and it.get("numberOfRooms"):
+            wynik["liczba_pokoi"] = str(_num(str(it.get("numberOfRooms"))))
+        if "rok_budowy" not in wynik and it.get("yearBuilt"):
+            wynik["rok_budowy"] = str(it["yearBuilt"])
+        if "material" not in wynik and it.get("material"):
+            mat = it.get("material")
+            if isinstance(mat, str): wynik["material"] = mat
+        if "rynek" not in wynik and it.get("itemCondition"):
+            cond = str(it["itemCondition"]).lower()
+            if "new" in cond: wynik["rynek"] = "pierwotny"
+            elif "used" in cond: wynik["rynek"] = "wtórny"
+
+def pobierz_dane_z_otodom(url: str) -> dict:
+    soup = _pobierz_soup(url)
+    wynik = {}
+    _extract_price_from_dom(soup, wynik)
+
+    opis = soup.find("meta", attrs={"name": "description"})
+    if opis and opis.has_attr("content"):
+        content = opis["content"]
+        if "cena" not in wynik:
+            cena_match = re.search(r"za cenę ([\d\s]+zł)", content)
+            if cena_match: wynik["cena"] = cena_match.group(1).strip()
+        metry_match = re.search(r"ma ([\d.,]+ m²)", content)
+        if metry_match: wynik["metry"] = metry_match.group(1).strip()
+        pietro_match = re.search(r"na ([^,\.]+? piętrze)", content)
+        if pietro_match:
+            pietro_raw = (pietro_match.group(1) or "").strip().lower()
+            if "parter" in pietro_raw:
+                wynik["pietro"] = "parter"
+            else:
+                tylko_numer = re.search(r"\d+", pietro_raw)
+                wynik["pietro"] = tylko_numer.group() if tylko_numer else ""
+
+    for sel in [
+        "strong[data-testid='ad-price-per-m']","div[data-testid='ad-price-per-m']",
+        "p[data-testid='ad-price-per-m']","span[data-testid='ad-price-per-m']",
+        "[data-testid='ad-price-per-m2']","[data-cy='ad-price-per-m']",
+    ]:
+        el = soup.select_one(sel)
+        if el:
+            wynik["cena_za_metr"] = el.get_text(strip=True)
+            break
+
+    szczegoly = soup.select("div[data-testid='table-value']")
+    for item in szczegoly:
+        label_elem = item.select_one("div[data-testid='table-value-title']")
+        value_elem = item.select_one("div[data-testid='table-value-value']")
+        if label_elem and value_elem:
+            label = label_elem.get_text(strip=True)
+            value = value_elem.get_text(strip=True)
+            if label in szukane_pola and szukane_pola[label] not in wynik:
+                wynik[szukane_pola[label]] = value
+
+    # generyk
+    labels = []; label_to_key = {}
+    for _canon, (key, syns) in LABEL_SYNONYMS.items():
+        for s in syns:
+            labels.append(re.escape(s))
+            label_to_key[s.lower()] = key
+    if labels:
+        pat = re.compile(rf"^(?:{'|'.join(labels)})\s*:?\s*$", re.I)
+        for node in soup.find_all(string=pat):
+            lab_raw = _norm_txt(node)
+            lab = re.sub(r":$", "", lab_raw, flags=re.I)
+            key = label_to_key.get(lab.lower())
+            if not key or wynik.get(key): continue
+            val = None
+            parent = node.parent
+            for cand in (
+                getattr(parent, "next_sibling", None),
+                getattr(parent, "find_next_sibling", lambda: None)(),
+                getattr(parent.parent if parent else None, "find_next_sibling", lambda: None)(),
+            ):
+                if hasattr(cand, "get_text"):
+                    t = _norm_txt(cand.get_text(" ", strip=True))
+                    if t and t.lower() != lab.lower():
+                        val = t
+                        break
+            if not val:
+                nxt = node.find_next(string=lambda t: _norm_txt(t) and _norm_txt(t).lower() != lab.lower())
+                if nxt: val = _norm_txt(nxt)
+            if val: wynik[key] = val
+
+    adres_string = _wyciagnij_adres_string(soup)
+    adr_jsonld_str = _address_from_jsonld(soup)
+    if adr_jsonld_str and len(adr_jsonld_str) > len(adres_string):
+        adres_string = adr_jsonld_str
+
+    adr = parsuj_adres_string(adres_string)
+    try:
+        adr = _safe_enrich_address(adr)
+    except Exception as e:
+        print(f"[WARN] Enrichment failed: {e}")
+
+    if not (adr.get("ulica_nazwa") or "").strip():
+        try:
+            for s in soup.find_all("script", attrs={"type": "application/ld+json"}):
+                raw = (s.string or "").strip()
+                if not raw: continue
+                data = json.loads(raw.replace("\n", " ").replace("\t", " "))
+                items = data if isinstance(data, list) else [data]
+                for it in items:
+                    addr = it.get("address")
+                    if isinstance(addr, dict):
+                        street = addr.get("streetAddress")
+                        if street:
+                            nazwa = re.sub(r"\s+\d.*$", "", street).strip()
+                            adr["ulica_nazwa"] = nazwa or street.strip()
+                            break
+                else:
+                    continue
+                break
+        except Exception:
+            pass
+
+    adr["gmina"] = _clean_gmina(adr.get("gmina"))
+    dzielnica_csv = adr.get("dzielnica") or ""
+    ulica_csv = adr.get("ulica_nazwa") or ""
+
+    canonical = soup.find("link", rel="canonical")
+    wynik["link"] = canonical["href"] if canonical and canonical.has_attr("href") else url
+
+    if not wynik.get("cena_za_metr"):
+        wynik["cena_za_metr"] = oblicz_cena_za_metr(wynik.get("cena", ""), wynik.get("metry", ""))
+
+    out = {
+        "cena": wynik.get("cena", ""),
+        "cena_za_metr": wynik.get("cena_za_metr", ""),
+        "metry": wynik.get("metry", ""),
+        "liczba_pokoi": wynik.get("liczba_pokoi", ""),
+        "pietro": wynik.get("pietro", ""),
+        "rynek": wynik.get("rynek", ""),
+        "rok_budowy": wynik.get("rok_budowy", ""),
+        "material": wynik.get("material", ""),
+        "wojewodztwo": adr.get("wojewodztwo") or "",
+        "powiat": adr.get("powiat") or "",
+        "gmina": adr.get("gmina") or "",
+        "miejscowosc": adr.get("miasto") or "",
+        "dzielnica": dzielnica_csv,
+        "ulica": ulica_csv,
+        "link": wynik["link"],
+    }
+    _consistency_pass_row(out)
     return out
 
-# ------------------------------ CSV ------------------------------
-def _read_existing_links(csv_path: Path) -> set[str]:
-    existing: set[str] = set()
-    if not csv_path.exists() or csv_path.stat().st_size == 0:
-        return existing
-    with csv_path.open("r", newline="", encoding="utf-8") as f:
-        sample = f.read(1024)
-        f.seek(0)
-        has_header = "link" in (sample.splitlines()[0].lower() if sample else "")
-        if has_header:
-            r = csv.DictReader(f)
-            for row in r:
-                u = (row.get("link") or "").strip()
-                if u:
-                    existing.add(u)
-        else:
-            rr = csv.reader(f)
-            for row in rr:
-                if not row:
-                    continue
-                u = (row[0] or "").strip()
-                if u and u.lower() != "link":
-                    existing.add(u)
-    return existing
+# ------------------------------ CSV I/O ------------------------------
+def _canon_slug(slug: str) -> str:
+    return slug.replace("--", "-").strip().lower()
 
-def append_links_with_timestamp(links: Iterable[str], csv_path: Path) -> int:
-    """
-    Zapisuje tylko nowe oferty – deduplikacja po ID (jeśli jest) oraz po pełnym URL.
-    """
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
+def _alt_slugs(slug: str) -> list[str]:
+    s = slug.strip().lower()
+    return list(dict.fromkeys([s, s.replace("--", "-"), s.replace("-", "--")]))
 
-    existing_links = _read_existing_links(csv_path)
-    existing_keys = { _offer_key(u) for u in existing_links }
+def _find_links_csv(slug: str) -> Path | None:
+    candidates = []
+    for s in _alt_slugs(slug):
+        candidates.append(BASE_LINKI_DIR / f"{s}.csv")
+        candidates.append(BASE_LINKI_DIR / f"intake_{s}.csv")
+    for p in candidates:
+        if p.exists() and p.stat().st_size > 0:
+            return p
+    return None
 
-    to_write = []
-    for u in links:
-        key = _offer_key(u)
-        if (u not in existing_links) and (key not in existing_keys):
-            to_write.append(u)
-            existing_links.add(u)
-            existing_keys.add(key)
+def _read_links_from_csv(path: Path) -> list[str]:
+    links = []
+    with path.open("r", newline="", encoding="utf-8") as f:
+        r = csv.reader(f)
+        header = next(r, None)
+        has_header = bool(header and ("link" in [c.strip().lower() for c in header]))
+        if not has_header and header and header[0].strip():
+            links.append(header[0].strip())
+        for row in r:
+            if not row: continue
+            u = (row[0] or "").strip()
+            if u: links.append(u)
+    return links
 
-    write_header = not csv_path.exists() or csv_path.stat().st_size == 0
-    with csv_path.open("a", newline="", encoding="utf-8") as f:
+def _append_rows_to_output_csv(output_csv: Path, rows: list[dict]):
+    write_header = not output_csv.exists() or output_csv.stat().st_size == 0
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    with output_csv.open("a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        if write_header:
-            w.writerow(["link", "captured_date", "captured_time"])
-        for u in to_write:
-            now = datetime.now(tz=_TZ) if _TZ else datetime.now()
-            w.writerow([u, now.date().isoformat(), now.time().isoformat(timespec="seconds")])
-    return len(to_write)
+        if write_header: w.writerow(KOLUMNY_WYJ)
+        for r in rows:
+            w.writerow([r.get(col, "") for col in KOLUMNY_WYJ])
 
-# ------------------------------ Runner ------------------------------
-def run_for_region(slug: str) -> tuple[int, int]:
-    """
-    Zwraca (total_found, newly_appended)
-    """
-    start_url = (
-        f"https://www.otodom.pl/pl/wyniki/sprzedaz/mieszkanie/{slug}"
-        "?limit=72&ownerTypeSingleSelect=ALL&by=DEFAULT&direction=DESC"
-    )
-    csv_path = BASE_DIR / f"intake_{slug}.csv"
+# ------------------------------ PIPE ------------------------------
+def przetworz_linki_do_csv(input_csv: Path, out_csv: Path):
+    try:
+        links = _read_links_from_csv(input_csv)
+    except Exception as e:
+        raise SystemExit(f"Nie mogę odczytać linków z {input_csv}: {e}")
 
-    print(f"\n========== {VOIVODESHIPS[slug]} ({slug}) ==========")
-    print(f"[INFO] URL startowy: {start_url}")
-    print(f"[INFO] Plik intake:  {csv_path.name}")
+    print(f"[INFO] Do przetworzenia linków: {len(links)}")
+    if not links:
+        print("[INFO] Brak linków w pliku — nic do zrobienia.")
+        _append_rows_to_output_csv(out_csv, [])
+        return
 
-    links = collect_links_all_pages(
-        start_url,
-        min_delay=1.5,
-        max_delay=5.0,
-        stop_after_k_empty_pages=25,
-        max_pages=None,  # bez limitu stron
-    )
-    added = append_links_with_timestamp(links, csv_path)
-    print(f"[OK] Zebrano {len(links)} linków, dopisano {added} nowych do {csv_path.name}")
-    return (len(links), added)
+    dane_lista: list[dict] = []
+    for i, link in enumerate(links, start=1):
+        print(f"\n🌐 [{i}/{len(links)}] {link}")
+        dane = None
+        for attempt in range(2):
+            try:
+                dane = pobierz_dane_z_otodom(link)
+                break
+            except Exception as e:
+                if _is_remote_closed(e) and attempt == 0:
+                    print(f"[WARN] Problem sieciowy: {e} — ponawiam…")
+                    time.sleep(2.0)
+                    continue
+                print(f"❌ Błąd przy linku: {e}")
+                dane = None
+                break
+        if not dane:
+            continue
+        for k in KOLUMNY_WYJ:
+            dane.setdefault(k, "")
+        if (dane.get("cena") or "").strip():
+            dane_lista.append(dane)
 
-# --------------------------- CLI ---------------------------
+    _append_rows_to_output_csv(out_csv, dane_lista)
+    print(f"\n✅ Zapisano {len(dane_lista)} rekordów do {out_csv}")
+
+# ------------------------------ CLI ------------------------------
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--region", "-r",
-        default=DEFAULT_REGION,
-        help=("Slug/etykieta województwa (np. 'mazowieckie' lub 'Mazowieckie'), "
-              "lista po przecinku (np. 'mazowieckie,slaskie') lub 'all' (domyślnie).")
-    )
+    ap.add_argument("--region", "-r", required=True, help="Slug województwa, np. 'mazowieckie'")
     args = ap.parse_args()
 
-    region_slugs = _slugify_region_input(args.region)
+    slug_in = args.region.strip().lower()
+    input_csv = _find_links_csv(slug_in)
+    if not input_csv:
+        raise SystemExit(
+            "Nie znaleziono pliku z linkami.\n"
+            f"Szukane warianty: {', '.join(str(BASE_LINKI_DIR / (s + '.csv')) for s in _alt_slugs(slug_in))} "
+            f"oraz intake_*.csv"
+        )
 
-    total_found = 0
-    total_added = 0
-    for slug in region_slugs:
-        found, added = run_for_region(slug)
-        total_found += found
-        total_added += added
-        # mała przerwa między województwami
-        time.sleep(_RNG.uniform(1.0, 2.5))
+    slug_out = _canon_slug(slug_in)
+    out_csv = BASE_WOJ_DIR / f"{slug_out}.csv"
 
-    print("\n=========== PODSUMOWANIE ===========")
-    print(f"Łącznie znalezionych linków: {total_found}")
-    print(f"Łącznie NOWO dopisanych:     {total_added}")
+    print(f"[INFO] Czytam linki z: {input_csv}")
+    print(f"[INFO] Zapis wyników do: {out_csv}")
+
+    przetworz_linki_do_csv(input_csv, out_csv)

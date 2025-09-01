@@ -11,7 +11,7 @@ from tkinter import ttk, messagebox
 
 APP_TITLE = "Baza danych – pobieranie i scraping"
 
-# Mapa: etykieta → slug (używany w nazwach plików)
+# Kategoria -> slug (dla nazw skryptów)
 CATEGORIES: list[tuple[str, str]] = [
     ("mieszkania", "mieszkania"),
     ("dom", "dom"),
@@ -20,7 +20,7 @@ CATEGORIES: list[tuple[str, str]] = [
     ("Hale i Magazyny", "hale_i_magazyny"),
 ]
 
-# 16 województw (etykieta do UI -> slug do URL/plików)
+# 16 województw (etykieta UI -> slug ASCII)
 VOIVODESHIPS: list[tuple[str, str]] = [
     ("Dolnośląskie", "dolnoslaskie"),
     ("Kujawsko-Pomorskie", "kujawsko-pomorskie"),
@@ -43,10 +43,27 @@ VOIVODESHIPS: list[tuple[str, str]] = [
 PYTHON = sys.executable
 
 
-def _resolve_script(script_name: str) -> Path | None:
-    base = Path(__file__).resolve().parent
-    p = (base / script_name).resolve()
+def _resolve_here(name: str) -> Path | None:
+    p = (Path(__file__).resolve().parent / name).resolve()
     return p if p.exists() else None
+
+
+def _resolve_pipeline_scripts(category_slug: str) -> tuple[Path | None, Path | None]:
+    """
+    Szuka skryptów 'linki_*' i 'scraper_*' dla wybranej kategorii.
+    Dla 'mieszkania' obsługuje oba warianty nazwy oraz fallback do ogólnego scrpera.
+    """
+    linki_candidates = [
+        f"linki_{category_slug}.py",              # np. linki_mieszkania.py
+        f"linki_{category_slug.rstrip('a')}.py",  # np. linki_mieszkanie.py (gdyby był)
+    ]
+    scraper_candidates = [
+        f"scraper_otodom_{category_slug}.py",     # np. scraper_otodom_mieszkania.py
+        "scraper_otodom.py",                      # ogólny fallback
+    ]
+    linki = next((p for n in linki_candidates if (p := _resolve_here(n)) is not None), None)
+    scraper = next((p for n in scraper_candidates if (p := _resolve_here(n)) is not None), None)
+    return linki, scraper
 
 
 class App(tk.Tk):
@@ -73,7 +90,6 @@ class App(tk.Tk):
 
         ttk.Label(wrapper, text="Co chcesz pobrać?", font=("Segoe UI", 12, "bold")).pack(anchor="w")
 
-        # wybór województwa
         region_box = ttk.Frame(wrapper)
         region_box.pack(fill="x", pady=(10, 0))
         ttk.Label(region_box, text="Województwo:").pack(side="left")
@@ -95,7 +111,6 @@ class App(tk.Tk):
         combo.bind("<<ComboboxSelected>>", _on_region_change)
         _on_region_change()
 
-        # przyciski kategorii
         btns = ttk.Frame(wrapper)
         btns.pack(anchor="w", pady=(10, 4))
         for label, slug in CATEGORIES:
@@ -104,8 +119,7 @@ class App(tk.Tk):
                 command=lambda s=slug, l=label: self._start_pipeline(l, s)
             ).pack(side="left", padx=6, pady=6)
 
-        sep = ttk.Separator(wrapper, orient="horizontal")
-        sep.pack(fill="x", pady=(10, 8))
+        ttk.Separator(wrapper, orient="horizontal").pack(fill="x", pady=(10, 8))
 
         info = ttk.LabelFrame(wrapper, text="Status", padding=10)
         info.pack(fill="x")
@@ -115,29 +129,22 @@ class App(tk.Tk):
 
         controls = ttk.Frame(wrapper)
         controls.pack(fill="x", pady=(12, 0))
-
-        # NOWOŚĆ: przycisk „Scalanie” obok „Zamknij”
         ttk.Button(controls, text="Zamknij", command=self._safe_close).pack(side="right")
         ttk.Button(controls, text="Scalanie", command=self._switch_to_scalanie).pack(side="right", padx=(0, 8))
 
     # ---------------- Pipeline ----------------
 
-    def _start_pipeline(self, label: str, slug: str):
+    def _start_pipeline(self, label: str, category_slug: str):
         if self._running_thread and self._running_thread.is_alive():
             messagebox.showinfo("W toku", "Inny proces jest w trakcie. Poczekaj na zakończenie.")
             return
 
-        linki_name = f"linki_{slug}.py"
-        scraper_name = f"scraper_otodom_{slug}.py"
-
-        linki_path = _resolve_script(linki_name)
-        scraper_path = _resolve_script(scraper_name)
-
-        missing = [name for name, p in [(linki_name, linki_path), (scraper_name, scraper_path)] if p is None]
+        linki_path, scraper_path = _resolve_pipeline_scripts(category_slug)
+        missing = [n for n, p in [("linki", linki_path), ("scraper", scraper_path)] if p is None]
         if missing:
             messagebox.showerror(
                 "Brak pliku",
-                "Nie znaleziono następujących skryptów w katalogu aplikacji:\n- " + "\n- ".join(missing),
+                "Nie znaleziono wymaganych skryptów dla tej kategorii:\n- " + "\n- ".join(missing),
             )
             return
 
@@ -149,15 +156,12 @@ class App(tk.Tk):
         self.var_phase2.set("Etap 2 (scraper): oczekiwanie…")
 
         def worker():
-            # 1) LINKI
             ok1, msg1 = self._run_script_blocking(linki_path, args=["--region", region_slug])
             self._set_after(lambda: self.var_phase1.set(f"Etap 1 (linki): {'wykonano ✅' if ok1 else 'błąd ❌'}{msg1}"))
-
             if not ok1:
                 self._set_after(lambda: self.var_status.set("Zatrzymano z powodu błędu w etapie 1."))
                 return
 
-            # 2) SCRAPER
             self._set_after(lambda: self.var_phase2.set("Etap 2 (scraper): uruchamianie…"))
             ok2, msg2 = self._run_script_blocking(scraper_path, args=["--region", region_slug])
             self._set_after(lambda: self.var_phase2.set(f"Etap 2 (scraper): {'wykonano ✅' if ok2 else 'błąd ❌'}{msg2}"))
@@ -190,18 +194,11 @@ class App(tk.Tk):
     # ---------------- Scalanie ----------------
 
     def _switch_to_scalanie(self):
-        """
-        Uruchamia scalanie.py i zamyka bieżące okno (czyli „wyłącza” bazydanych.py).
-        Jeśli jakiś pipeline trwa, pyta o potwierdzenie przerwania.
-        """
         if self._running_thread and self._running_thread.is_alive():
-            if not messagebox.askyesno(
-                "Wciąż trwa",
-                "Proces jeszcze działa. Przerwać i przejść do Scalanie?"
-            ):
+            if not messagebox.askyesno("Wciąż trwa", "Proces jeszcze działa. Przerwać i przejść do Scalanie?"):
                 return
 
-        scal_path = _resolve_script("scalanie.py")
+        scal_path = _resolve_here("scalanie.py")
         if scal_path is None:
             messagebox.showerror("Brak pliku", "Nie znaleziono pliku scalanie.py w katalogu aplikacji.")
             return
@@ -212,7 +209,6 @@ class App(tk.Tk):
             messagebox.showerror("Błąd uruchamiania", f"Nie udało się uruchomić scalanie.py:\n{e}")
             return
 
-        # zamknij to okno/aplikację
         self.destroy()
 
     # ---------------- Lifecycle ----------------

@@ -14,13 +14,6 @@ from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime
-try:
-    from zoneinfo import ZoneInfo  # Python 3.9+
-    _TZ = ZoneInfo("Europe/Warsaw")
-except Exception:
-    _TZ = None
-
 from secrets import SystemRandom
 _RNG = SystemRandom()
 
@@ -47,10 +40,10 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Kolejność ustalona, by raport był przewidywalny
-VOIVODESHIPS_ORDERED: List[tuple[str, str]] = [
+# Slugi województw – ASCII, poj. myślnik
+VOIVODESHIPS_ORDERED: list[tuple[str, str]] = [
     ("dolnoslaskie", "Dolnośląskie"),
-    ("kujawsko--pomorskie", "Kujawsko-Pomorskie"),
+    ("kujawsko-pomorskie", "Kujawsko-Pomorskie"),
     ("lubelskie", "Lubelskie"),
     ("lubuskie", "Lubuskie"),
     ("lodzkie", "Łódzkie"),
@@ -67,7 +60,7 @@ VOIVODESHIPS_ORDERED: List[tuple[str, str]] = [
     ("zachodniopomorskie", "Zachodniopomorskie"),
 ]
 VOIVODESHIPS = dict(VOIVODESHIPS_ORDERED)
-DEFAULT_REGION = "all"  # domyślnie wszystkie
+DEFAULT_REGION = "all"
 
 # ------------------------------ Utils ------------------------------
 def _slugify_region_input(raw: str) -> List[str]:
@@ -95,12 +88,10 @@ def _slugify_region_input(raw: str) -> List[str]:
             f"Dozwolone slugi: {valid}\n"
             f"Albo użyj: --region all"
         )
-    seen = set()
-    uniq = []
+    seen = set(); uniq = []
     for s in out:
         if s not in seen:
-            uniq.append(s)
-            seen.add(s)
+            uniq.append(s); seen.add(s)
     return uniq
 
 def add_or_replace_query_param(url: str, key: str, value: str) -> str:
@@ -109,9 +100,6 @@ def add_or_replace_query_param(url: str, key: str, value: str) -> str:
     q[key] = [str(value)]
     parts[4] = urlencode(q, doseq=True)
     return urlunparse(parts)
-
-def _strip_accents(text: str) -> str:
-    return "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
 
 _ID_RE = re.compile(r"/pl/oferta/[^/]*-(\d{5,})")
 def _offer_key(url: str) -> str:
@@ -267,11 +255,11 @@ def _limit_from_url(url: str, default: int = 36) -> int:
 
 def _pages_from_total(url: str, user_agent: str) -> tuple[int, int, int]:
     total = _fetch_total_results(url, user_agent)
-    limit = _limit_from_url(url, default=36)  # zwykle 36 lub 72
+    limit = _limit_from_url(url, default=36)
     pages = math.ceil(total / max(limit, 1))
     return pages, total, limit
 
-# ------------------------------ Core ------------------------------
+# ------------------------------ Core — zbieranie linków ------------------------------
 def collect_links_all_pages(
     search_url: str,
     min_delay: float = 1.5,
@@ -280,7 +268,8 @@ def collect_links_all_pages(
     max_pages: Optional[int] = None,
 ) -> list[str]:
     fetcher = _make_fetcher()
-    seen_keys, out = set(), []
+    seen_keys: set[str] = set()
+    out: list[str] = []
     page = 1
     empty_streak = 0
     try:
@@ -353,7 +342,7 @@ def _read_existing_links(csv_path: Path) -> set[str]:
                     existing.add(u)
     return existing
 
-def append_links_with_timestamp(links: Iterable[str], csv_path: Path) -> int:
+def append_links(links: Iterable[str], csv_path: Path) -> int:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     existing_links = _read_existing_links(csv_path)
     existing_keys = {_offer_key(u) for u in existing_links}
@@ -368,10 +357,9 @@ def append_links_with_timestamp(links: Iterable[str], csv_path: Path) -> int:
     with csv_path.open("a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         if write_header:
-            w.writerow(["link", "captured_date", "captured_time"])
+            w.writerow(["link"])
         for u in to_write:
-            now = datetime.now(tz=_TZ) if _TZ else datetime.now()
-            w.writerow([u, now.date().isoformat(), now.time().isoformat(timespec="seconds")])
+            w.writerow([u])
     return len(to_write)
 
 # ------------------------------ Runner ------------------------------
@@ -380,11 +368,11 @@ def run_for_region(slug: str) -> tuple[int, int]:
         f"https://www.otodom.pl/pl/wyniki/sprzedaz/mieszkanie/{slug}"
         "?limit=72&ownerTypeSingleSelect=ALL&by=DEFAULT&direction=DESC"
     )
-    csv_path = BASE_LINKI / f"intake_{slug}.csv"   # <<< ZAPIS NA PULPICIE / baza danych / linki
+    csv_path = BASE_LINKI / f"{slug}.csv"
 
     print(f"\n========== {VOIVODESHIPS[slug]} ({slug}) ==========")
     print(f"[INFO] URL startowy: {start_url}")
-    print(f"[INFO] Plik intake:  {csv_path}")
+    print(f"[INFO] Plik z linkami: {csv_path}")
 
     try:
         pages, total, limit = _pages_from_total(start_url, USER_AGENT)
@@ -401,7 +389,7 @@ def run_for_region(slug: str) -> tuple[int, int]:
         stop_after_k_empty_pages=25,
         max_pages=max_pages,
     )
-    added = append_links_with_timestamp(links, csv_path)
+    added = append_links(links, csv_path)
     print(f"[OK] Zebrano {len(links)} linków, dopisano {added} nowych do {csv_path.name}")
     return (len(links), added)
 
