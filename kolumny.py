@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import sys
+import csv
 from pathlib import Path
 from typing import List
 import tkinter as tk
@@ -23,42 +24,87 @@ VALUE_COLS: List[str] = [
     "Statyczna wartość nieruchomości"
 ]
 
+# Nagłówek plików wynikowych CSV (tak jak w scraperach)
+WYNIKI_HEADER: List[str] = [
+    "cena","cena_za_metr","metry","liczba_pokoi","pietro","rynek","rok_budowy","material",
+    "wojewodztwo","powiat","gmina","miejscowosc","dzielnica","ulica","link",
+]
+
 SUPPORTED = {".xlsx", ".xlsm"}
 
-# --------------------- NOWE: foldery na Pulpicie/Desktop ---------------------
+# --- REGIONY: pracujemy na etykietach (PL) i slugach (ASCII) ---
+VOIVODESHIPS_LABEL_SLUG: list[tuple[str, str]] = [
+    ("Dolnośląskie", "dolnoslaskie"),
+    ("Kujawsko-Pomorskie", "kujawsko-pomorskie"),
+    ("Lubelskie", "lubelskie"),
+    ("Lubuskie", "lubuskie"),
+    ("Łódzkie", "lodzkie"),
+    ("Małopolskie", "malopolskie"),
+    ("Mazowieckie", "mazowieckie"),
+    ("Opolskie", "opolskie"),
+    ("Podkarpackie", "podkarpackie"),
+    ("Podlaskie", "podlaskie"),
+    ("Pomorskie", "pomorskie"),
+    ("Śląskie", "slaskie"),
+    ("Świętokrzyskie", "swietokrzyskie"),
+    ("Warmińsko-Mazurskie", "warminsko-mazurskie"),
+    ("Wielkopolskie", "wielkopolskie"),
+    ("Zachodniopomorskie", "zachodniopomorskie"),
+]
+
+# --------------------- Desktop/Pulpit ---------------------
 def _detect_desktop() -> Path:
-    """
-    Zwraca ścieżkę do Pulpitu/Desktop (obsługa PL/EN).
-    Jeśli nie istnieje, zwraca katalog domowy.
-    """
     home = Path.home()
-    candidates = [home / "Desktop", home / "Pulpit"]
-    for c in candidates:
-        if c.exists():
-            return c
+    for name in ("Desktop", "Pulpit"):
+        p = home / name
+        if p.exists():
+            return p
     return home
 
 def ensure_base_dirs() -> Path:
-    """
-    Tworzy na Pulpicie/Desktop folder:
-      'baza danych' oraz podfoldery: 'linki', 'województwa'
-    Zwraca ścieżkę do folderu 'baza danych'.
-    """
     desktop = _detect_desktop()
     base = desktop / "baza danych"
     (base / "linki").mkdir(parents=True, exist_ok=True)
     (base / "województwa").mkdir(parents=True, exist_ok=True)
     return base
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
+
+# --------------------- CSV helpery -----------------------
+def _ensure_csv(path: Path, header: List[str]) -> bool:
+    """Utwórz CSV z podanym nagłówkiem (UTF-8 BOM dla Excela), jeżeli nie istnieje."""
+    if path.exists():
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        if header:
+            w.writerow(header)
+    return True
+
+def create_voivodeship_csvs(base: Path) -> dict:
+    """
+    Tworzy pliki dla KAŻDEGO województwa:
+      • linki/<Etykieta>.csv          (nagłówek: ["link"])
+      • województwa/<Etykieta>.csv    (nagłówek: WYNIKI_HEADER)
+    Niczego nie nadpisuje – tylko jeśli brak.
+    Zwraca liczbę nowych plików.
+    """
+    created = {"linki": 0, "województwa": 0}
+    linki_dir = base / "linki"
+    woj_dir = base / "województwa"
+    for label, _slug in VOIVODESHIPS_LABEL_SLUG:
+        if _ensure_csv(linki_dir / f"{label}.csv", ["link"]):
+            created["linki"] += 1
+        if _ensure_csv(woj_dir / f"{label}.csv", WYNIKI_HEADER):
+            created["województwa"] += 1
+    return created
+# ---------------------------------------------------------
 
 def _ensure_base_headers(ws) -> None:
-    # jeżeli pusty arkusz — wpisz od razu bazowe REQ_COLS
     if ws.max_row == 1 and ws.max_column == 1 and (ws.cell(1,1).value in (None, "")):
         for c, h in enumerate(REQ_COLS, start=1):
             ws.cell(row=1, column=c, value=h)
         return
-
-    # dopisz brakujące bazowe nagłówki na końcu (bez VALUE_COLS)
     existing = [cell.value or "" for cell in ws[1]]
     for col in REQ_COLS:
         if col not in existing:
@@ -66,15 +112,11 @@ def _ensure_base_headers(ws) -> None:
             existing.append(col)
 
 def _ensure_value_cols_after_anchor(ws, anchor="Czy udziały?") -> None:
-    # odczytaj nagłówki
     headers = [cell.value or "" for cell in ws[1]]
-    # zapewnij, że anchor istnieje
     if anchor not in headers:
         ws.cell(row=1, column=ws.max_column + 1, value=anchor)
         headers = [cell.value or "" for cell in ws[1]]
-
     anchor_idx = headers.index(anchor) + 1  # 1-based
-    # sprawdź czy trzy kolumny za anchor mają już właściwe nazwy
     want = VALUE_COLS
     ok = True
     for offset, name in enumerate(want, start=1):
@@ -83,11 +125,8 @@ def _ensure_value_cols_after_anchor(ws, anchor="Czy udziały?") -> None:
             ok = False
             break
     if ok:
-        return  # już jest dobrze
-
-    # wstaw 3 kolumny za anchor
+        return
     ws.insert_cols(anchor_idx + 1, amount=3)
-    # ustaw nagłówki nowo wstawionych kolumn
     for i, name in enumerate(want, start=1):
         ws.cell(row=1, column=anchor_idx + i, value=name)
 
@@ -97,12 +136,10 @@ def ensure_sheet_and_columns(xlsx_path: Path) -> None:
     except Exception:
         wb = Workbook()
         wb.active.title = RAPORT_SHEET
-
     for sheet_name in (RAPORT_SHEET, RAPORT_ODF):
         ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.create_sheet(sheet_name)
         _ensure_base_headers(ws)
         _ensure_value_cols_after_anchor(ws, anchor="Czy udziały?")
-
     wb.save(xlsx_path)
 
 def pick_file_via_gui() -> Path:
@@ -131,12 +168,19 @@ def error(msg: str) -> None:
         print("BŁĄD:", msg, file=sys.stderr)
 
 def main():
-    # 1) Utwórz strukturę katalogów na Pulpicie/Desktop
+    # 1) Tworzenie struktury folderów
     try:
         base_dir = ensure_base_dirs()
     except Exception as e:
         error(f"Nie udało się utworzyć folderów na Pulpicie/Desktop:\n{e}")
         raise SystemExit(3)
+
+    # 1a) NOWE: załóż z góry CSV dla wszystkich województw (linki + województwa) wg ETYKIET
+    try:
+        created = create_voivodeship_csvs(base_dir)
+    except Exception as e:
+        error(f"Nie udało się utworzyć plików CSV dla województw:\n{e}")
+        raise SystemExit(4)
 
     # 2) Wybór/obsługa pliku Excel
     if len(sys.argv) >= 2:
@@ -153,10 +197,9 @@ def main():
         info(
             "Przygotowano arkusze 'raport' i 'raport_odfiltrowane' oraz dodano kolumny za 'Czy udziały?'\n"
             f"Plik: {xlsx_path}\n\n"
-            "Utworzono/zweryfikowano również strukturę folderów na Pulpicie/Desktop:\n"
-            f"• {base_dir}\n"
-            f"• {base_dir/'linki'}\n"
-            f"• {base_dir/'województwa'}"
+            "Utworzono/zweryfikowano również strukturę folderów i CSV per województwo (etykiety):\n"
+            f"• {base_dir/'linki'} — nowych plików: {created.get('linki',0)}\n"
+            f"• {base_dir/'województwa'} — nowych plików: {created.get('województwa',0)}"
         )
     except Exception as e:
         error(f"Nie udało się przygotować pliku:\n{e}")

@@ -22,21 +22,63 @@ print("[SCRAPER] Uruchomiono scraper_otodom_mieszkania.py")
 # ------------------------------ ŚCIEŻKI ------------------------------
 def _detect_desktop() -> Path:
     home = Path.home()
-    for name in ("Desktop", "Pulpit"):
+    for name in ("Desktop","Pulpit"):
         p = home / name
         if p.exists():
             return p
     return home
 
 BASE_BAZA = _detect_desktop() / "baza danych"
-BASE_LINKI_DIR = BASE_BAZA / "linki"
-BASE_WOJ_DIR   = BASE_BAZA / "województwa"
+BASE_LINKI_DIR = BASE_BAZA / "linki"          # CSV z linkami (ETYKIETY)
+BASE_WOJ_DIR   = BASE_BAZA / "województwa"    # CSV z wynikami (ETYKIETY)
 BASE_LINKI_DIR.mkdir(parents=True, exist_ok=True)
 BASE_WOJ_DIR.mkdir(parents=True, exist_ok=True)
 
+# ------------------------------ REGION UTILS ------------------------------
+VOIVODESHIPS_LABEL_SLUG: list[tuple[str, str]] = [
+    ("Dolnośląskie", "dolnoslaskie"),
+    ("Kujawsko-Pomorskie", "kujawsko-pomorskie"),
+    ("Lubelskie", "lubelskie"),
+    ("Lubuskie", "lubuskie"),
+    ("Łódzkie", "lodzkie"),
+    ("Małopolskie", "malopolskie"),
+    ("Mazowieckie", "mazowieckie"),
+    ("Opolskie", "opolskie"),
+    ("Podkarpackie", "podkarpackie"),
+    ("Podlaskie", "podlaskie"),
+    ("Pomorskie", "pomorskie"),
+    ("Śląskie", "slaskie"),
+    ("Świętokrzyskie", "swietokrzyskie"),
+    ("Warmińsko-Mazurskie", "warminsko-mazurskie"),
+    ("Wielkopolskie", "wielkopolskie"),
+    ("Zachodniopomorskie", "zachodniopomorskie"),
+]
+SLUG_TO_LABEL = {slug: label for label, slug in VOIVODESHIPS_LABEL_SLUG}
+LABEL_TO_SLUG = {label.lower(): slug for label, slug in VOIVODESHIPS_LABEL_SLUG}
+
+def normalize_region_single(raw: str) -> tuple[str, str]:
+    s = (raw or "").strip()
+    low = s.lower()
+    if low in SLUG_TO_LABEL:
+        return SLUG_TO_LABEL[low], low
+    if low in LABEL_TO_SLUG:
+        slug = LABEL_TO_SLUG[low]
+        return SLUG_TO_LABEL[slug], slug
+    raise SystemExit(f"Nieznane województwo: {raw}")
+
 # ------------------------------ KONFIG ------------------------------
+from adres_otodom import (
+    set_contact_email,
+    parsuj_adres_string,
+    uzupelnij_braki_z_nominatim,
+    dopelnij_powiat_gmina_jesli_brak,
+    _clean_gmina,
+    _consistency_pass_row,
+)
+
 CONTACT_EMAIL = "twoj_email@domena.pl"
 WAIT_SECONDS = 20
+set_contact_email(CONTACT_EMAIL)
 
 KOLUMNY_WYJ = [
     "cena","cena_za_metr","metry","liczba_pokoi","pietro","rynek","rok_budowy","material",
@@ -61,17 +103,6 @@ LABEL_SYNONYMS = {
     "Materiał budynku": ("material", ["Materiał budynku", "Materiał", "Materiał bud."]),
     "Piętro": ("pietro", ["Piętro", "Kondygnacja", "Poziom"]),
 }
-
-from adres_otodom import (
-    set_contact_email,
-    parsuj_adres_string,
-    uzupelnij_braki_z_nominatim,
-    dopelnij_powiat_gmina_jesli_brak,
-    _clean_gmina,
-    _consistency_pass_row,
-)
-
-set_contact_email(CONTACT_EMAIL)
 
 def format_pln_int(x) -> str | None:
     if x is None: return None
@@ -104,15 +135,16 @@ def oblicz_cena_za_metr(cena_str: str, metry_str: str) -> str:
 def _norm_txt(s: str | None) -> str:
     return re.sub(r"\s+", " ", (s or "").replace("\xa0", " ")).strip()
 
+_REMOTE_CLOSED_MARKERS = (
+    "remote end closed connection without response",
+    "remotedisconnected",
+    "connection reset",
+    "chunked encoding",
+)
 def _is_remote_closed(exc: Exception) -> bool:
     s = (str(exc) or "").lower()
     if isinstance(exc, RemoteDisconnected): return True
-    return any(m in s for m in (
-        "remote end closed connection without response",
-        "remotedisconnected",
-        "connection reset",
-        "chunked encoding",
-    ))
+    return any(m in s for m in _REMOTE_CLOSED_MARKERS)
 
 def _safe_enrich_address(adr: dict, tries: int = 5, base_sleep: float = 1.2) -> dict:
     cur = dict(adr or {})
@@ -296,35 +328,21 @@ def pobierz_dane_z_otodom(url: str) -> dict:
             if label in szukane_pola and szukane_pola[label] not in wynik:
                 wynik[szukane_pola[label]] = value
 
-    # generyk
-    labels = []; label_to_key = {}
-    for _canon, (key, syns) in LABEL_SYNONYMS.items():
-        for s in syns:
-            labels.append(re.escape(s))
-            label_to_key[s.lower()] = key
-    if labels:
-        pat = re.compile(rf"^(?:{'|'.join(labels)})\s*:?\s*$", re.I)
-        for node in soup.find_all(string=pat):
-            lab_raw = _norm_txt(node)
-            lab = re.sub(r":$", "", lab_raw, flags=re.I)
-            key = label_to_key.get(lab.lower())
-            if not key or wynik.get(key): continue
-            val = None
-            parent = node.parent
-            for cand in (
-                getattr(parent, "next_sibling", None),
-                getattr(parent, "find_next_sibling", lambda: None)(),
-                getattr(parent.parent if parent else None, "find_next_sibling", lambda: None)(),
-            ):
-                if hasattr(cand, "get_text"):
-                    t = _norm_txt(cand.get_text(" ", strip=True))
-                    if t and t.lower() != lab.lower():
-                        val = t
-                        break
-            if not val:
-                nxt = node.find_next(string=lambda t: _norm_txt(t) and _norm_txt(t).lower() != lab.lower())
-                if nxt: val = _norm_txt(nxt)
-            if val: wynik[key] = val
+    try:
+        for s in soup.find_all("script", attrs={"type": "application/ld+json"}):
+            raw = (s.string or "").strip()
+            if not raw: continue
+            try:
+                data = json.loads(raw)
+                _fill_from_jsonld(data, wynik)
+            except Exception:
+                try:
+                    data = json.loads(raw.replace("\n", " ").replace("\t", " "))
+                    _fill_from_jsonld(data, wynik)
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
     adres_string = _wyciagnij_adres_string(soup)
     adr_jsonld_str = _address_from_jsonld(soup)
@@ -388,23 +406,28 @@ def pobierz_dane_z_otodom(url: str) -> dict:
     _consistency_pass_row(out)
     return out
 
-# ------------------------------ CSV I/O ------------------------------
-def _canon_slug(slug: str) -> str:
-    return slug.replace("--", "-").strip().lower()
+# ------------------------------ CSV I/O (ETYKIETY) ------------------------------
+def _links_paths_candidates(label: str, slug: str) -> list[Path]:
+    return [
+        BASE_LINKI_DIR / f"{label}.csv",
+        BASE_LINKI_DIR / f"{slug}.csv",            # legacy
+        BASE_LINKI_DIR / f"intake_{label}.csv",    # legacy
+        BASE_LINKI_DIR / f"intake_{slug}.csv",     # legacy
+    ]
 
-def _alt_slugs(slug: str) -> list[str]:
-    s = slug.strip().lower()
-    return list(dict.fromkeys([s, s.replace("--", "-"), s.replace("-", "--")]))
-
-def _find_links_csv(slug: str) -> Path | None:
-    candidates = []
-    for s in _alt_slugs(slug):
-        candidates.append(BASE_LINKI_DIR / f"{s}.csv")
-        candidates.append(BASE_LINKI_DIR / f"intake_{s}.csv")
-    for p in candidates:
+def _find_links_csv(label: str, slug: str) -> Path | None:
+    for p in _links_paths_candidates(label, slug):
         if p.exists() and p.stat().st_size > 0:
             return p
     return None
+
+def _ensure_results_csv_label(label: str) -> Path:
+    p = BASE_WOJ_DIR / f"{label}.csv"
+    if not p.exists():
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("w", newline="", encoding="utf-8-sig") as f:
+            csv.writer(f).writerow(KOLUMNY_WYJ)
+    return p
 
 def _read_links_from_csv(path: Path) -> list[str]:
     links = []
@@ -415,17 +438,14 @@ def _read_links_from_csv(path: Path) -> list[str]:
         if not has_header and header and header[0].strip():
             links.append(header[0].strip())
         for row in r:
-            if not row: continue
-            u = (row[0] or "").strip()
-            if u: links.append(u)
+            if row and row[0].strip():
+                links.append(row[0].strip())
     return links
 
 def _append_rows_to_output_csv(output_csv: Path, rows: list[dict]):
-    write_header = not output_csv.exists() or output_csv.stat().st_size == 0
-    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_results_csv_label(output_csv.stem)
     with output_csv.open("a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        if write_header: w.writerow(KOLUMNY_WYJ)
         for r in rows:
             w.writerow([r.get(col, "") for col in KOLUMNY_WYJ])
 
@@ -438,8 +458,8 @@ def przetworz_linki_do_csv(input_csv: Path, out_csv: Path):
 
     print(f"[INFO] Do przetworzenia linków: {len(links)}")
     if not links:
-        print("[INFO] Brak linków w pliku — nic do zrobienia.")
-        _append_rows_to_output_csv(out_csv, [])
+        print("[INFO] Brak linków — nic do zrobienia.")
+        _ensure_results_csv_label(out_csv.stem)
         return
 
     dane_lista: list[dict] = []
@@ -471,22 +491,18 @@ def przetworz_linki_do_csv(input_csv: Path, out_csv: Path):
 # ------------------------------ CLI ------------------------------
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--region", "-r", required=True, help="Slug województwa, np. 'mazowieckie'")
+    ap.add_argument("--region", "-r", required=True, help="Etykieta (np. 'Mazowieckie') lub slug (np. 'mazowieckie')")
     args = ap.parse_args()
 
-    slug_in = args.region.strip().lower()
-    input_csv = _find_links_csv(slug_in)
+    label, slug = normalize_region_single(args.region)
+    input_csv = _find_links_csv(label, slug)
     if not input_csv:
         raise SystemExit(
             "Nie znaleziono pliku z linkami.\n"
-            f"Szukane warianty: {', '.join(str(BASE_LINKI_DIR / (s + '.csv')) for s in _alt_slugs(slug_in))} "
-            f"oraz intake_*.csv"
+            f"Szukane: {BASE_LINKI_DIR / (label + '.csv')} oraz warianty legacy."
         )
 
-    slug_out = _canon_slug(slug_in)
-    out_csv = BASE_WOJ_DIR / f"{slug_out}.csv"
-
+    out_csv = BASE_WOJ_DIR / f"{label}.csv"
     print(f"[INFO] Czytam linki z: {input_csv}")
     print(f"[INFO] Zapis wyników do: {out_csv}")
-
     przetworz_linki_do_csv(input_csv, out_csv)

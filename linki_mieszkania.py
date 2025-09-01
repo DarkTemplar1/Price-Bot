@@ -7,7 +7,6 @@ import json
 import math
 import re
 import time
-import unicodedata
 from pathlib import Path
 from typing import Iterable, List, Optional
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
@@ -17,7 +16,7 @@ from bs4 import BeautifulSoup
 from secrets import SystemRandom
 _RNG = SystemRandom()
 
-# ------------------------------ WYJŚCIE: Desktop/Pulpit ------------------------------
+# ------------------------------ WYJŚCIE ------------------------------
 def _detect_desktop() -> Path:
     home = Path.home()
     for name in ("Desktop", "Pulpit"):
@@ -31,7 +30,7 @@ BASE_LINKI = BASE_BAZA / "linki"
 BASE_WOJ = BASE_BAZA / "województwa"
 BASE_LINKI.mkdir(parents=True, exist_ok=True)
 BASE_WOJ.mkdir(parents=True, exist_ok=True)
-# -------------------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 
 WAIT_SECONDS = 20
 RETRIES_NAV = 3
@@ -40,60 +39,59 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Slugi województw – ASCII, poj. myślnik
-VOIVODESHIPS_ORDERED: list[tuple[str, str]] = [
-    ("dolnoslaskie", "Dolnośląskie"),
-    ("kujawsko-pomorskie", "Kujawsko-Pomorskie"),
-    ("lubelskie", "Lubelskie"),
-    ("lubuskie", "Lubuskie"),
-    ("lodzkie", "Łódzkie"),
-    ("malopolskie", "Małopolskie"),
-    ("mazowieckie", "Mazowieckie"),
-    ("opolskie", "Opolskie"),
-    ("podkarpackie", "Podkarpackie"),
-    ("podlaskie", "Podlaskie"),
-    ("pomorskie", "Pomorskie"),
-    ("slaskie", "Śląskie"),
-    ("swietokrzyskie", "Świętokrzyskie"),
-    ("warminsko-mazurskie", "Warmińsko-Mazurskie"),
-    ("wielkopolskie", "Wielkopolskie"),
-    ("zachodniopomorskie", "Zachodniopomorskie"),
+# --- REGION UTILS: etykieta <-> slug (pojedynczy myślnik) + URL slugi (dwumyslnik dla 2 woj.) ---
+VOIVODESHIPS_LABEL_SLUG: list[tuple[str, str]] = [
+    ("Dolnośląskie", "dolnoslaskie"),
+    ("Kujawsko-Pomorskie", "kujawsko-pomorskie"),
+    ("Lubelskie", "lubelskie"),
+    ("Lubuskie", "lubuskie"),
+    ("Łódzkie", "lodzkie"),
+    ("Małopolskie", "malopolskie"),
+    ("Mazowieckie", "mazowieckie"),
+    ("Opolskie", "opolskie"),
+    ("Podkarpackie", "podkarpackie"),
+    ("Podlaskie", "podlaskie"),
+    ("Pomorskie", "pomorskie"),
+    ("Śląskie", "slaskie"),
+    ("Świętokrzyskie", "swietokrzyskie"),
+    ("Warmińsko-Mazurskie", "warminsko-mazurskie"),
+    ("Wielkopolskie", "wielkopolskie"),
+    ("Zachodniopomorskie", "zachodniopomorskie"),
 ]
-VOIVODESHIPS = dict(VOIVODESHIPS_ORDERED)
-DEFAULT_REGION = "all"
+SLUG_TO_LABEL = {slug: label for label, slug in VOIVODESHIPS_LABEL_SLUG}
+LABEL_TO_SLUG = {label.lower(): slug for label, slug in VOIVODESHIPS_LABEL_SLUG}
 
-# ------------------------------ Utils ------------------------------
-def _slugify_region_input(raw: str) -> List[str]:
+URL_SLUG_OVERRIDES = {
+    "kujawsko-pomorskie": "kujawsko--pomorskie",
+    "warminsko-mazurskie": "warminsko--mazurskie",
+}
+def url_slug(slug: str) -> str:
+    return URL_SLUG_OVERRIDES.get(slug, slug)
+
+def normalize_region_input(raw: str) -> list[tuple[str, str]]:
     if not raw or raw.strip().lower() == "all":
-        return [slug for slug, _ in VOIVODESHIPS_ORDERED]
-    label_to_slug = {v.lower(): k for k, v in VOIVODESHIPS.items()}
-    out: List[str] = []
+        return [(label, slug) for label, slug in VOIVODESHIPS_LABEL_SLUG]
+    out: list[tuple[str, str]] = []
     for part in raw.split(","):
-        s = part.strip().lower()
+        s = part.strip()
         if not s:
             continue
-        if s in VOIVODESHIPS:
-            out.append(s)
+        low = s.lower()
+        if low in SLUG_TO_LABEL:
+            out.append((SLUG_TO_LABEL[low], low))
+        elif low in LABEL_TO_SLUG:
+            slug = LABEL_TO_SLUG[low]
+            out.append((SLUG_TO_LABEL[slug], slug))
         else:
-            slug = label_to_slug.get(s)
-            if slug:
-                out.append(slug)
-            else:
-                out.append(s)
-    bad = [s for s in out if s not in VOIVODESHIPS]
-    if bad:
-        valid = ", ".join(VOIVODESHIPS.keys())
-        raise SystemExit(
-            f"Nieznane województwo/slug: {', '.join(bad)}\n"
-            f"Dozwolone slugi: {valid}\n"
-            f"Albo użyj: --region all"
-        )
-    seen = set(); uniq = []
-    for s in out:
-        if s not in seen:
-            uniq.append(s); seen.add(s)
+            raise SystemExit(f"Nieznane województwo: {s}")
+    # uniq
+    seen=set(); uniq=[]
+    for lab, sl in out:
+        if sl not in seen:
+            seen.add(sl); uniq.append((lab, sl))
     return uniq
 
+# ------------------------------ Utils ------------------------------
 def add_or_replace_query_param(url: str, key: str, value: str) -> str:
     parts = list(urlparse(url))
     q = parse_qs(parts[4], keep_blank_values=True)
@@ -255,9 +253,51 @@ def _limit_from_url(url: str, default: int = 36) -> int:
 
 def _pages_from_total(url: str, user_agent: str) -> tuple[int, int, int]:
     total = _fetch_total_results(url, user_agent)
-    limit = _limit_from_url(url, default=36)
+    limit = _limit_from_url(url, default=36)  # zwykle 36 lub 72
     pages = math.ceil(total / max(limit, 1))
     return pages, total, limit
+
+# ------------------------------ CSV I/O (ETYKIETY) ------------------------------
+def _links_path_label(label: str) -> Path:
+    return BASE_LINKI / f"{label}.csv"
+
+def _links_path_slug(slug: str) -> Path:
+    return BASE_LINKI / f"{slug}.csv"
+
+def _read_links_any(label: str, slug: str) -> list[str]:
+    paths = [
+        _links_path_label(label),
+        _links_path_slug(slug),                       # legacy
+        BASE_LINKI / f"intake_{label}.csv",          # legacy
+        BASE_LINKI / f"intake_{slug}.csv",           # legacy
+    ]
+    links: list[str] = []
+    for p in paths:
+        if not p.exists() or p.stat().st_size == 0:
+            continue
+        with p.open("r", newline="", encoding="utf-8") as f:
+            r = csv.reader(f)
+            header = next(r, None)
+            has_header = bool(header and ("link" in [c.strip().lower() for c in header]))
+            if not has_header and header and header[0].strip():
+                links.append(header[0].strip())
+            for row in r:
+                if row and row[0].strip():
+                    links.append(row[0].strip())
+    # uniq z zachowaniem kolejności
+    seen=set(); out=[]
+    for u in links:
+        if u not in seen:
+            seen.add(u); out.append(u)
+    return out
+
+def _ensure_results_csv_label(label: str, header: list[str]) -> Path:
+    p = BASE_WOJ / f"{label}.csv"
+    if not p.exists():
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("w", newline="", encoding="utf-8-sig") as f:
+            csv.writer(f).writerow(header)
+    return p
 
 # ------------------------------ Core — zbieranie linków ------------------------------
 def collect_links_all_pages(
@@ -317,69 +357,21 @@ def collect_links_all_pages(
         fetcher.close()
     return out
 
-# ------------------------------ CSV ------------------------------
-def _read_existing_links(csv_path: Path) -> set[str]:
-    existing: set[str] = set()
-    if not csv_path.exists() or csv_path.stat().st_size == 0:
-        return existing
-    with csv_path.open("r", newline="", encoding="utf-8") as f:
-        sample = f.read(1024)
-        f.seek(0)
-        has_header = "link" in (sample.splitlines()[0].lower() if sample else "")
-        if has_header:
-            r = csv.DictReader(f)
-            for row in r:
-                u = (row.get("link") or "").strip()
-                if u:
-                    existing.add(u)
-        else:
-            rr = csv.reader(f)
-            for row in rr:
-                if not row:
-                    continue
-                u = (row[0] or "").strip()
-                if u and u.lower() != "link":
-                    existing.add(u)
-    return existing
-
-def append_links(links: Iterable[str], csv_path: Path) -> int:
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    existing_links = _read_existing_links(csv_path)
-    existing_keys = {_offer_key(u) for u in existing_links}
-    to_write = []
-    for u in links:
-        key = _offer_key(u)
-        if (u not in existing_links) and (key not in existing_keys):
-            to_write.append(u)
-            existing_links.add(u)
-            existing_keys.add(key)
-    write_header = not csv_path.exists() or csv_path.stat().st_size == 0
-    with csv_path.open("a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        if write_header:
-            w.writerow(["link"])
-        for u in to_write:
-            w.writerow([u])
-    return len(to_write)
-
-# ------------------------------ Runner ------------------------------
-def run_for_region(slug: str) -> tuple[int, int]:
+def run_for_region(label: str, slug: str) -> tuple[int, int]:
     start_url = (
-        f"https://www.otodom.pl/pl/wyniki/sprzedaz/mieszkanie/{slug}"
+        f"https://www.otodom.pl/pl/wyniki/sprzedaz/mieszkanie/{url_slug(slug)}"
         "?limit=72&ownerTypeSingleSelect=ALL&by=DEFAULT&direction=DESC"
     )
-    csv_path = BASE_LINKI / f"{slug}.csv"
-
-    print(f"\n========== {VOIVODESHIPS[slug]} ({slug}) ==========")
+    print(f"\n========== {label} ({slug}) ==========")
     print(f"[INFO] URL startowy: {start_url}")
-    print(f"[INFO] Plik z linkami: {csv_path}")
+    print(f"[INFO] Plik z linkami: {_links_path_label(label)}")
 
     try:
         pages, total, limit = _pages_from_total(start_url, USER_AGENT)
-        print(f"[INFO] Ogłoszeń łącznie: {total} | limit/stronę: {limit} | stron do sprawdzenia: {pages}")
+        print(f"[INFO] Ogłoszeń łącznie: {total} | limit/stronę: {limit} | stron: {pages}")
         max_pages = pages
     except Exception as e:
-        print(f"[WARN] Nie udało się ustalić liczby stron ({e}). Lecę bez twardego limitu.")
+        print(f"[WARN] Nie ustalono liczby stron ({e}). Lecę bez twardego limitu.")
         max_pages = None
 
     links = collect_links_all_pages(
@@ -389,26 +381,46 @@ def run_for_region(slug: str) -> tuple[int, int]:
         stop_after_k_empty_pages=25,
         max_pages=max_pages,
     )
-    added = append_links(links, csv_path)
-    print(f"[OK] Zebrano {len(links)} linków, dopisano {added} nowych do {csv_path.name}")
+    # dopisz do „<Etykieta>.csv” (z deduplikacją czytaną z wszystkich wariantów)
+    added = append_links_label(links, label, slug)
+    print(f"[OK] Zebrano {len(links)} linków, dopisano {added} nowych do {label}.csv")
     return (len(links), added)
+
+# ------------------------------ CSV dopisywanie ------------------------------
+def append_links_label(links: Iterable[str], label: str, slug: str) -> int:
+    existing = set(_read_links_any(label, slug))
+    existing_keys = {_offer_key(u) for u in existing}
+    to_write = []
+    for u in links:
+        k = _offer_key(u)
+        if u not in existing and k not in existing_keys:
+            to_write.append(u)
+            existing.add(u); existing_keys.add(k)
+    out_path = _links_path_label(label)
+    if not out_path.exists():
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open("w", newline="", encoding="utf-8-sig") as f:
+            csv.writer(f).writerow(["link"])
+    with out_path.open("a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        for u in to_write:
+            w.writerow([u])
+    return len(to_write)
 
 # --------------------------- CLI ---------------------------
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument(
-        "--region", "-r",
-        default=DEFAULT_REGION,
-        help=("Slug/etykieta województwa (np. 'mazowieckie' lub 'Mazowieckie'), "
-              "lista po przecinku (np. 'mazowieckie,slaskie') lub 'all' (domyślnie).")
+        "--region","-r", default="all",
+        help="Etykieta (np. 'Mazowieckie') lub slug (np. 'mazowieckie'), lista po przecinku lub 'all'"
     )
     args = ap.parse_args()
 
-    region_slugs = _slugify_region_input(args.region)
+    regions = normalize_region_input(args.region)
     total_found = 0
     total_added = 0
-    for slug in region_slugs:
-        found, added = run_for_region(slug)
+    for label, slug in regions:
+        found, added = run_for_region(label, slug)
         total_found += found
         total_added += added
         time.sleep(_RNG.uniform(1.0, 2.5))

@@ -17,22 +17,57 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-# ------------------------------ WYJŚCIE: Desktop/Pulpit ------------------------------
+print("[SCRAPER] Uruchomiono scraper_otodom.py")
+
+# ------------------------------ ŚCIEŻKI ------------------------------
 def _detect_desktop() -> Path:
     home = Path.home()
-    for name in ("Desktop", "Pulpit"):
+    for name in ("Desktop","Pulpit"):
         p = home / name
         if p.exists():
             return p
     return home
 
 BASE_BAZA = _detect_desktop() / "baza danych"
-BASE_LINKI_DIR = BASE_BAZA / "linki"            # katalog z plikami {slug}.csv
-BASE_WOJ_DIR = BASE_BAZA / "województwa"        # wynik: {slug}.csv
+BASE_LINKI_DIR = BASE_BAZA / "linki"          # CSV z linkami (ETYKIETY)
+BASE_WOJ_DIR   = BASE_BAZA / "województwa"    # CSV z wynikami (ETYKIETY)
 BASE_LINKI_DIR.mkdir(parents=True, exist_ok=True)
 BASE_WOJ_DIR.mkdir(parents=True, exist_ok=True)
-# -------------------------------------------------------------------------------------
 
+# ------------------------------ REGION UTILS ------------------------------
+VOIVODESHIPS_LABEL_SLUG: list[tuple[str, str]] = [
+    ("Dolnośląskie", "dolnoslaskie"),
+    ("Kujawsko-Pomorskie", "kujawsko-pomorskie"),
+    ("Lubelskie", "lubelskie"),
+    ("Lubuskie", "lubuskie"),
+    ("Łódzkie", "lodzkie"),
+    ("Małopolskie", "malopolskie"),
+    ("Mazowieckie", "mazowieckie"),
+    ("Opolskie", "opolskie"),
+    ("Podkarpackie", "podkarpackie"),
+    ("Podlaskie", "podlaskie"),
+    ("Pomorskie", "pomorskie"),
+    ("Śląskie", "slaskie"),
+    ("Świętokrzyskie", "swietokrzyskie"),
+    ("Warmińsko-Mazurskie", "warminsko-mazurskie"),
+    ("Wielkopolskie", "wielkopolskie"),
+    ("Zachodniopomorskie", "zachodniopomorskie"),
+]
+SLUG_TO_LABEL = {slug: label for label, slug in VOIVODESHIPS_LABEL_SLUG}
+LABEL_TO_SLUG = {label.lower(): slug for label, slug in VOIVODESHIPS_LABEL_SLUG}
+
+def normalize_region_single(raw: str) -> tuple[str, str]:
+    """Zwraca (Label, slug) dla pojedynczego regionu, akceptuje etykietę lub slug."""
+    s = (raw or "").strip()
+    low = s.lower()
+    if low in SLUG_TO_LABEL:
+        return SLUG_TO_LABEL[low], low
+    if low in LABEL_TO_SLUG:
+        slug = LABEL_TO_SLUG[low]
+        return SLUG_TO_LABEL[slug], slug
+    raise SystemExit(f"Nieznane województwo: {raw}")
+
+# ------------------------------ KONFIG / ADRESY ------------------------------
 from adres_otodom import (
     set_contact_email,
     parsuj_adres_string,
@@ -71,16 +106,12 @@ LABEL_SYNONYMS = {
 }
 
 def format_pln_int(x) -> str | None:
-    if x is None:
-        return None
-    try:
-        return f"{int(x):,} zł".replace(",", " ")
-    except Exception:
-        return None
+    if x is None: return None
+    try: return f"{int(x):,} zł".replace(",", " ")
+    except Exception: return None
 
 def fmt_metry(value) -> str | None:
-    if value is None:
-        return None
+    if value is None: return None
     try:
         v = float(str(value).replace(",", "."))
         s = f"{v:.2f}".rstrip("0").rstrip(".").replace(".", ",")
@@ -89,8 +120,7 @@ def fmt_metry(value) -> str | None:
         return None
 
 def _num(s: str):
-    if not s:
-        return None
+    if not s: return None
     digits = re.sub(r"[^\d]", "", s)
     return int(digits) if digits else None
 
@@ -98,10 +128,8 @@ def oblicz_cena_za_metr(cena_str: str, metry_str: str) -> str:
     try:
         cena = int(re.sub(r"[^\d]", "", cena_str or ""))
         metry = float((metry_str or "").replace(",", ".").replace("m²", "").strip())
-        if not cena or not metry:
-            return ""
-        wynik = round(cena / metry)
-        return f"{wynik} zł/m²"
+        if not cena or not metry: return ""
+        return f"{round(cena / metry)} zł/m²"
     except Exception:
         return ""
 
@@ -116,8 +144,7 @@ _REMOTE_CLOSED_MARKERS = (
 )
 def _is_remote_closed(exc: Exception) -> bool:
     s = (str(exc) or "").lower()
-    if isinstance(exc, RemoteDisconnected):
-        return True
+    if isinstance(exc, RemoteDisconnected): return True
     return any(m in s for m in _REMOTE_CLOSED_MARKERS)
 
 def _safe_enrich_address(adr: dict, tries: int = 5, base_sleep: float = 1.2) -> dict:
@@ -152,8 +179,7 @@ def _extract_price_from_dom(soup, wynik: dict):
 def _address_from_jsonld(soup) -> str:
     for s in soup.find_all("script", attrs={"type": "application/ld+json"}):
         raw = (s.string or "").strip()
-        if not raw:
-            continue
+        if not raw: continue
         try:
             data = json.loads(raw)
         except Exception:
@@ -169,15 +195,11 @@ def _address_from_jsonld(soup) -> str:
                 street = addr.get("streetAddress")
                 locality = addr.get("addressLocality") or addr.get("addressRegion")
                 country = addr.get("addressCountry")
-                if street:
-                    parts.append(_norm_txt(street))
-                if locality:
-                    parts.append(_norm_txt(locality))
-                if country:
-                    parts.append(country if isinstance(country, str) else _norm_txt(country.get("name", "")))
+                if street: parts.append(_norm_txt(street))
+                if locality: parts.append(_norm_txt(locality))
+                if country: parts.append(country if isinstance(country, str) else _norm_txt(country.get("name", "")))
                 s = ", ".join([p for p in parts if p])
-                if s:
-                    return s
+                if s: return s
     return ""
 
 def _pobierz_soup(url: str):
@@ -240,12 +262,10 @@ def _wyciagnij_adres_string(soup) -> str:
     return ""
 
 def _fill_from_jsonld(obj, wynik: dict):
-    if not isinstance(obj, (dict, list)):
-        return
+    if not isinstance(obj, (dict, list)): return
     items = obj if isinstance(obj, list) else [obj]
     for it in items:
-        if not isinstance(it, dict):
-            continue
+        if not isinstance(it, dict): continue
         offers = it.get("offers") or it.get("offer")
         if isinstance(offers, dict):
             if "cena" not in wynik and offers.get("price"):
@@ -254,22 +274,18 @@ def _fill_from_jsonld(obj, wynik: dict):
         if isinstance(floor_size, dict) and "metry" not in wynik:
             v = floor_size.get("value") or it.get("valueReference")
             m2 = fmt_metry(v)
-            if m2:
-                wynik["metry"] = m2
+            if m2: wynik["metry"] = m2
         if "liczba_pokoi" not in wynik and it.get("numberOfRooms"):
             wynik["liczba_pokoi"] = str(_num(str(it.get("numberOfRooms"))))
         if "rok_budowy" not in wynik and it.get("yearBuilt"):
             wynik["rok_budowy"] = str(it["yearBuilt"])
         if "material" not in wynik and it.get("material"):
             mat = it.get("material")
-            if isinstance(mat, str):
-                wynik["material"] = mat
+            if isinstance(mat, str): wynik["material"] = mat
         if "rynek" not in wynik and it.get("itemCondition"):
             cond = str(it["itemCondition"]).lower()
-            if "new" in cond:
-                wynik["rynek"] = "pierwotny"
-            elif "used" in cond:
-                wynik["rynek"] = "wtórny"
+            if "new" in cond: wynik["rynek"] = "pierwotny"
+            elif "used" in cond: wynik["rynek"] = "wtórny"
 
 def pobierz_dane_z_otodom(url: str) -> dict:
     soup = _pobierz_soup(url)
@@ -281,14 +297,12 @@ def pobierz_dane_z_otodom(url: str) -> dict:
         content = opis["content"]
         if "cena" not in wynik:
             cena_match = re.search(r"za cenę ([\d\s]+zł)", content)
-            if cena_match:
-                wynik["cena"] = cena_match.group(1).strip()
+            if cena_match: wynik["cena"] = cena_match.group(1).strip()
         metry_match = re.search(r"ma ([\d.,]+ m²)", content)
-        if metry_match:
-            wynik["metry"] = metry_match.group(1).strip()
+        if metry_match: wynik["metry"] = metry_match.group(1).strip()
         pietro_match = re.search(r"na ([^,\.]+? piętrze)", content)
         if pietro_match:
-            pietro_raw = pietro_match.group(1).strip().lower()
+            pietro_raw = (pietro_match.group(1) or "").strip().lower()
             if "parter" in pietro_raw:
                 wynik["pietro"] = "parter"
             else:
@@ -296,12 +310,9 @@ def pobierz_dane_z_otodom(url: str) -> dict:
                 wynik["pietro"] = tylko_numer.group() if tylko_numer else ""
 
     for sel in [
-        "strong[data-testid='ad-price-per-m']",
-        "div[data-testid='ad-price-per-m']",
-        "p[data-testid='ad-price-per-m']",
-        "span[data-testid='ad-price-per-m']",
-        "[data-testid='ad-price-per-m2']",
-        "[data-cy='ad-price-per-m']",
+        "strong[data-testid='ad-price-per-m']","div[data-testid='ad-price-per-m']",
+        "p[data-testid='ad-price-per-m']","span[data-testid='ad-price-per-m']",
+        "[data-testid='ad-price-per-m2']","[data-cy='ad-price-per-m']",
     ]:
         el = soup.select_one(sel)
         if el:
@@ -318,41 +329,20 @@ def pobierz_dane_z_otodom(url: str) -> dict:
             if label in szukane_pola and szukane_pola[label] not in wynik:
                 wynik[szukane_pola[label]] = value
 
-    # generik
-    labels = []
-    label_to_key = {}
-    for _canon, (key, syns) in LABEL_SYNONYMS.items():
-        for s in syns:
-            labels.append(re.escape(s))
-            label_to_key[s.lower()] = key
-    if labels:
-        pat = re.compile(rf"^(?:{'|'.join(labels)})\s*:?\s*$", re.I)
-        for node in soup.find_all(string=pat):
-            lab_raw = _norm_txt(node)
-            lab = re.sub(r":$", "", lab_raw, flags=re.I)
-            key = label_to_key.get(lab.lower())
-            if not key or wynik.get(key):
-                continue
-            val = None
-            parent = node.parent
-            for cand in (
-                getattr(parent, "next_sibling", None),
-                getattr(parent, "find_next_sibling", lambda: None)(),
-                getattr(parent.parent if parent else None, "find_next_sibling", lambda: None)(),
-            ):
-                if hasattr(cand, "get_text"):
-                    t = _norm_txt(cand.get_text(" ", strip=True))
-                    if t and t.lower() != lab.lower():
-                        val = t
-                        break
-            if not val:
-                nxt = node.find_next(string=lambda t: _norm_txt(t) and _norm_txt(t).lower() != lab.lower())
-                if nxt:
-                    val = _norm_txt(nxt)
-            if val:
-                wynik[key] = val
+    # heurystyki
+    for s in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        raw = (s.string or "").strip()
+        if not raw: continue
+        try:
+            data = json.loads(raw)
+            _fill_from_jsonld(data, wynik)
+        except Exception:
+            try:
+                data = json.loads(raw.replace("\n", " ").replace("\t", " "))
+                _fill_from_jsonld(data, wynik)
+            except Exception:
+                pass
 
-    # adres
     adres_string = _wyciagnij_adres_string(soup)
     adr_jsonld_str = _address_from_jsonld(soup)
     if adr_jsonld_str and len(adr_jsonld_str) > len(adres_string):
@@ -368,8 +358,7 @@ def pobierz_dane_z_otodom(url: str) -> dict:
         try:
             for s in soup.find_all("script", attrs={"type": "application/ld+json"}):
                 raw = (s.string or "").strip()
-                if not raw:
-                    continue
+                if not raw: continue
                 data = json.loads(raw.replace("\n", " ").replace("\t", " "))
                 items = data if isinstance(data, list) else [data]
                 found = False
@@ -382,8 +371,7 @@ def pobierz_dane_z_otodom(url: str) -> dict:
                             adr["ulica_nazwa"] = nazwa or street.strip()
                             found = True
                             break
-                if found:
-                    break
+                if found: break
         except Exception:
             pass
 
@@ -394,10 +382,8 @@ def pobierz_dane_z_otodom(url: str) -> dict:
     canonical = soup.find("link", rel="canonical")
     wynik["link"] = canonical["href"] if canonical and canonical.has_attr("href") else url
 
-    if "cena_za_metr" not in wynik or not wynik["cena_za_metr"]:
+    if not wynik.get("cena_za_metr"):
         wynik["cena_za_metr"] = oblicz_cena_za_metr(wynik.get("cena", ""), wynik.get("metry", ""))
-
-    miejscowosc = adr.get("miasto") or ""
 
     out = {
         "cena": wynik.get("cena", ""),
@@ -411,32 +397,36 @@ def pobierz_dane_z_otodom(url: str) -> dict:
         "wojewodztwo": adr.get("wojewodztwo") or "",
         "powiat": adr.get("powiat") or "",
         "gmina": adr.get("gmina") or "",
-        "miejscowosc": miejscowosc,
+        "miejscowosc": adr.get("miasto") or "",
         "dzielnica": dzielnica_csv,
         "ulica": ulica_csv,
         "link": wynik["link"],
     }
-
     _consistency_pass_row(out)
     return out
 
-# ------------------------------ CSV I/O ------------------------------
-def _canon_slug(slug: str) -> str:
-    return slug.replace("--", "-").strip().lower()
+# ------------------------------ CSV I/O (ETYKIETY) ------------------------------
+def _links_paths_candidates(label: str, slug: str) -> list[Path]:
+    return [
+        BASE_LINKI_DIR / f"{label}.csv",
+        BASE_LINKI_DIR / f"{slug}.csv",            # legacy
+        BASE_LINKI_DIR / f"intake_{label}.csv",    # legacy
+        BASE_LINKI_DIR / f"intake_{slug}.csv",     # legacy
+    ]
 
-def _alt_slugs(slug: str) -> list[str]:
-    s = slug.strip().lower()
-    return list(dict.fromkeys([s, s.replace("--", "-"), s.replace("-", "--")]))
-
-def _find_links_csv(slug: str) -> Path | None:
-    candidates = []
-    for s in _alt_slugs(slug):
-        candidates.append(BASE_LINKI_DIR / f"{s}.csv")
-        candidates.append(BASE_LINKI_DIR / f"intake_{s}.csv")  # legacy
-    for p in candidates:
+def _find_links_csv(label: str, slug: str) -> Path | None:
+    for p in _links_paths_candidates(label, slug):
         if p.exists() and p.stat().st_size > 0:
             return p
     return None
+
+def _ensure_results_csv_label(label: str) -> Path:
+    p = BASE_WOJ_DIR / f"{label}.csv"
+    if not p.exists():
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("w", newline="", encoding="utf-8-sig") as f:
+            csv.writer(f).writerow(KOLUMNY_WYJ)
+    return p
 
 def _read_links_from_csv(path: Path) -> list[str]:
     links = []
@@ -447,20 +437,14 @@ def _read_links_from_csv(path: Path) -> list[str]:
         if not has_header and header and header[0].strip():
             links.append(header[0].strip())
         for row in r:
-            if not row:
-                continue
-            u = (row[0] or "").strip()
-            if u:
-                links.append(u)
+            if row and row[0].strip():
+                links.append(row[0].strip())
     return links
 
 def _append_rows_to_output_csv(output_csv: Path, rows: list[dict]):
-    write_header = not output_csv.exists() or output_csv.stat().st_size == 0
-    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_results_csv_label(output_csv.stem)
     with output_csv.open("a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        if write_header:
-            w.writerow(KOLUMNY_WYJ)
         for r in rows:
             w.writerow([r.get(col, "") for col in KOLUMNY_WYJ])
 
@@ -473,8 +457,8 @@ def przetworz_linki_do_csv(input_csv: Path, out_csv: Path):
 
     print(f"[INFO] Do przetworzenia linków: {len(links)}")
     if not links:
-        print("[INFO] Brak linków w pliku — nic do zrobienia.")
-        _append_rows_to_output_csv(out_csv, [])
+        print("[INFO] Brak linków — nic do zrobienia.")
+        _ensure_results_csv_label(out_csv.stem)
         return
 
     dane_lista: list[dict] = []
@@ -506,22 +490,18 @@ def przetworz_linki_do_csv(input_csv: Path, out_csv: Path):
 # ------------------------------ CLI ------------------------------
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--region", "-r", required=True, help="Slug województwa, np. 'mazowieckie'")
+    ap.add_argument("--region", "-r", required=True, help="Etykieta (np. 'Mazowieckie') lub slug (np. 'mazowieckie')")
     args = ap.parse_args()
 
-    slug_in = args.region.strip().lower()
-    input_csv = _find_links_csv(slug_in)
+    label, slug = normalize_region_single(args.region)
+    input_csv = _find_links_csv(label, slug)
     if not input_csv:
         raise SystemExit(
             "Nie znaleziono pliku z linkami.\n"
-            f"Szukane warianty: {', '.join(str(BASE_LINKI_DIR / (s + '.csv')) for s in _alt_slugs(slug_in))} "
-            f"oraz intake_*.csv"
+            f"Szukane: {BASE_LINKI_DIR / (label + '.csv')} oraz warianty legacy."
         )
 
-    slug_out = _canon_slug(slug_in)
-    out_csv = BASE_WOJ_DIR / f"{slug_out}.csv"
-
+    out_csv = BASE_WOJ_DIR / f"{label}.csv"
     print(f"[INFO] Czytam linki z: {input_csv}")
     print(f"[INFO] Zapis wyników do: {out_csv}")
-
     przetworz_linki_do_csv(input_csv, out_csv)
