@@ -427,4 +427,3 @@ if __name__ == "__main__":
 
     print("\n=========== PODSUMOWANIE ===========")
     print(f"Łącznie znalezionych linków: {total_found}")
-    print(f"Łącznie NOWO dopisanych:     {total_added}")

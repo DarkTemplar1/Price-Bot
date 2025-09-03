@@ -10,9 +10,18 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-APP_TITLE = "Baza danych – pobieranie i scraping"
+import re
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
-# KATEGORIE → nazwy skryptów
+APP_TITLE = "Baza danych – pobieranie i scraping"
+PYTHON = sys.executable
+
+# =================== GUI KONFIG ===================
 CATEGORIES: list[tuple[str, str]] = [
     ("mieszkania", "mieszkania"),
     ("dom", "dom"),
@@ -20,8 +29,6 @@ CATEGORIES: list[tuple[str, str]] = [
     ("inwestycje", "inwestycje"),
     ("Hale i Magazyny", "hale_i_magazyny"),
 ]
-
-# Etykieta (PL) -> slug
 VOIVODESHIPS: list[tuple[str, str]] = [
     ("Dolnośląskie", "dolnoslaskie"),
     ("Kujawsko-Pomorskie", "kujawsko-pomorskie"),
@@ -41,8 +48,6 @@ VOIVODESHIPS: list[tuple[str, str]] = [
     ("Zachodniopomorskie", "zachodniopomorskie"),
 ]
 
-PYTHON = sys.executable
-
 def _resolve_script(script_name: str) -> Path | None:
     base = Path(__file__).resolve().parent
     p = (base / script_name).resolve()
@@ -57,7 +62,6 @@ def _detect_desktop() -> Path:
     return home
 
 def _ensure_per_region_files(label: str) -> tuple[Path, Path]:
-    """Zapewnij istnienie CSV: linki/<Label>.csv, województwa/<Label>.csv (UTF-8 BOM z nagłówkiem)."""
     base = _detect_desktop() / "baza danych"
     linki_dir = base / "linki"
     woj_dir   = base / "województwa"
@@ -80,6 +84,7 @@ def _ensure_per_region_files(label: str) -> tuple[Path, Path]:
 
     return linki_csv, wyniki_csv
 
+# =================== APP ===================
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -126,10 +131,10 @@ class App(tk.Tk):
 
         btns = ttk.Frame(wrapper)
         btns.pack(anchor="w", pady=(10, 4))
-        for label, slugcat in CATEGORIES:
+        for label, slug_cat in CATEGORIES:
             ttk.Button(
                 btns, text=label, width=22,
-                command=lambda s=slugcat, l=label: self._start_pipeline(l, s)
+                command=lambda s=slug_cat, l=label: self._start_pipeline(l, s)
             ).pack(side="left", padx=6, pady=6)
 
         ttk.Separator(wrapper, orient="horizontal").pack(fill="x", pady=(10, 8))
@@ -145,43 +150,39 @@ class App(tk.Tk):
         ttk.Button(controls, text="Zamknij", command=self._safe_close).pack(side="right")
 
     # ---------------- Pipeline ----------------
-
     def _start_pipeline(self, label_cat: str, slug_cat: str):
         if self._running_thread and self._running_thread.is_alive():
-            messagebox.showinfo("W toku", "Inny proces jest w trakcie. Poczekaj na zakończenie.")
+            messagebox.showinfo("W toku", "Inny proces jest w trakcie. Poczekaj.")
             return
 
-        # Skrypty
+        # poprawione slug_cat
         linki_candidates = [f"linki_{slug_cat}.py", f"linki_{slug_cat.rstrip('a')}.py"]
         scraper_candidates = [f"scraper_otodom_{slug_cat}.py", "scraper_otodom.py"]
         linki_path = next((p for n in linki_candidates if (p := _resolve_script(n)) is not None), None)
         scraper_path = next((p for n in scraper_candidates if (p := _resolve_script(n)) is not None), None)
-
-        missing = [n for n,p in [("linki", linki_path), ("scraper", scraper_path)] if p is None]
-        if missing:
-            messagebox.showerror("Brak pliku", "Brak skryptów: " + ", ".join(missing)); return
+        if not linki_path or not scraper_path:
+            messagebox.showerror("Brak pliku", "Nie znaleziono wymaganych skryptów.")
+            return
 
         region_label = self.var_region_label.get()
-        # region_slug  = self.var_region_slug.get()
-
-        # Upewnij się, że CSV dla etapu istnieją (ETYKIETY)
-        _ensure_per_region_files(region_label)
+        linki_csv, _ = _ensure_per_region_files(region_label)
 
         self.var_status.set(f"Uruchamiam: {label_cat} — woj. {region_label}")
         self.var_phase1.set("Etap 1 (linki): uruchamianie…")
         self.var_phase2.set("Etap 2 (scraper): oczekiwanie…")
 
         def worker():
-            # 1) linki: przekaż ETYKIETĘ (skrypt i tak normalizuje)
             ok1, msg1 = self._run_script_blocking(linki_path, args=["--region", region_label])
-            self._set_after(lambda: self.var_phase1.set(f"Etap 1 (linki): {'wykonano ✅' if ok1 else 'błąd ❌'}{msg1}"))
+            self._set_after(lambda: self.var_phase1.set(f"Etap 1 (linki): {'✅' if ok1 else '❌'}{msg1}"))
             if not ok1:
                 self._set_after(lambda: self.var_status.set("Stop: błąd w etapie 1.")); return
 
-            # 2) scraper: przekaż ETYKIETĘ
             self._set_after(lambda: self.var_phase2.set("Etap 2 (scraper): uruchamianie…"))
-            ok2, msg2 = self._run_script_blocking(scraper_path, args=["--region", region_label])
-            self._set_after(lambda: self.var_phase2.set(f"Etap 2 (scraper): {'wykonano ✅' if ok2 else 'błąd ❌'}{msg2}"))
+            self._set_after(self._poll_progress)  # <<< START odczytu postępu
+
+            args = ["--input", str(linki_csv), "--label", region_label]
+            ok2, msg2 = self._run_script_blocking(scraper_path, args=args)
+            self._set_after(lambda: self.var_phase2.set(f"Etap 2 (scraper): {'✅' if ok2 else '❌'}{msg2}"))
 
             if ok2:
                 self._set_after(lambda: self.var_status.set(f"Zakończono: {label_cat} — woj. {region_label}"))
@@ -192,27 +193,109 @@ class App(tk.Tk):
         self._running_thread = t
         t.start()
 
+    def _poll_progress(self):
+        """Czytaj scraper_progress.txt i aktualizuj GUI"""
+        progress_file = Path("scraper_progress.txt")
+        if progress_file.exists():
+            try:
+                status = progress_file.read_text(encoding="utf-8").strip()
+                if status:
+                    self.var_phase2.set(f"Etap 2 (scraper): {status}")
+            except Exception:
+                pass
+        if self._running_thread and self._running_thread.is_alive():
+            self.after(3000, self._poll_progress)
+
     def _run_script_blocking(self, path: Path, args: list[str] | None = None) -> tuple[bool, str]:
         try:
             proc = subprocess.run([PYTHON, str(path)] + (args or []), capture_output=False, timeout=None)
             return (proc.returncode == 0, f" (kod wyjścia={proc.returncode})")
         except FileNotFoundError:
-            return (False, " (nie znaleziono pliku wykonywalnego)")
+            return (False, " (brak pliku)")
         except Exception as e:
             return (False, f" ({e})")
 
     def _set_after(self, fn):
-        try:
-            self.after(0, fn)
-        except Exception:
-            pass
+        try: self.after(0, fn)
+        except Exception: pass
 
-    # ---------------- Lifecycle ----------------
     def _safe_close(self):
         if self._running_thread and self._running_thread.is_alive():
-            if not messagebox.askyesno("Wciąż trwa", "Proces jeszcze działa. Na pewno zamknąć okno?"):
+            if not messagebox.askyesno("Wciąż trwa", "Proces działa. Na pewno zamknąć okno?"):
                 return
         self.destroy()
+
+# =================== SCRAPER FUNKCJA ===================
+def pobierz_dane_z_otodom(url: str) -> dict:
+    """Pobiera dane z pojedynczego ogłoszenia Otodom"""
+    opts = Options()
+    opts.add_argument("--headless=new")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    driver = webdriver.Chrome(options=opts)
+
+    try:
+        driver.get(url)
+        # czekamy tylko na <body>, które zawsze będzie
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+        html = driver.page_source
+    except Exception as e:
+        print(f"❌ Błąd przy linku: {url} ({e})")
+        with open("bledy.csv", "a", encoding="utf-8-sig", newline="") as f:
+            csv.writer(f).writerow([url, str(e)])
+        return {"link": url}
+    finally:
+        driver.quit()
+
+    soup = BeautifulSoup(html, "html.parser")
+    dane: dict[str, str] = {}
+
+    # Cena
+    cena_elem = soup.select_one("strong[data-testid='ad-price']")
+    dane["cena"] = cena_elem.get_text(strip=True) if cena_elem else ""
+
+    # Cena za m²
+    cena_m2_elem = soup.select_one("div[data-testid='ad-price-per-m']")
+    dane["cena_za_metr"] = cena_m2_elem.get_text(strip=True) if cena_m2_elem else ""
+
+    # Powierzchnia
+    metry_elem = soup.find("div", string=re.compile("Powierzchnia"))
+    dane["metry"] = metry_elem.find_next("div").get_text(strip=True) if metry_elem else ""
+
+    # Liczba pokoi
+    pokoje_elem = soup.find("div", string=re.compile("Liczba pokoi"))
+    dane["liczba_pokoi"] = pokoje_elem.find_next("div").get_text(strip=True) if pokoje_elem else ""
+
+    # Piętro
+    pietro_elem = soup.find("div", string=re.compile("Piętro"))
+    dane["pietro"] = pietro_elem.find_next("div").get_text(strip=True) if pietro_elem else ""
+
+    # Rynek
+    rynek_elem = soup.find("div", string=re.compile("Rynek"))
+    dane["rynek"] = rynek_elem.find_next("div").get_text(strip=True) if rynek_elem else ""
+
+    # Rok budowy
+    rok_elem = soup.find("div", string=re.compile("Rok budowy"))
+    dane["rok_budowy"] = rok_elem.find_next("div").get_text(strip=True) if rok_elem else ""
+
+    # Materiał budynku
+    material_elem = soup.find("div", string=re.compile("Materiał"))
+    dane["material"] = material_elem.find_next("div").get_text(strip=True) if material_elem else ""
+
+    # Lokalizacja
+    breadcrumbs = soup.select("a[data-testid='breadcrumb-link']")
+    for i, crumb in enumerate(breadcrumbs):
+        txt = crumb.get_text(strip=True)
+        if i == 1: dane["wojewodztwo"] = txt
+        elif i == 2: dane["powiat"] = txt
+        elif i == 3: dane["gmina"] = txt; dane["miejscowosc"] = txt
+        elif i == 4: dane["dzielnica"] = txt
+        elif i == 5: dane["ulica"] = txt
+
+    dane["link"] = url
+    return dane
+
 
 if __name__ == "__main__":
     App().mainloop()
