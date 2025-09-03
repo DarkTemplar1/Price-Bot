@@ -14,17 +14,11 @@ APP_TITLE = "Sortownia – uruchamianie filtrów"
 
 # Opcje w comboboxie → odpowiadające im pliki skryptów
 FILTER_OPTIONS = [
-    "jeden właściciel",
-    "lokal mieszkalny",
-    "Jeden właściciel i Lokal mieszkalny",
+    # (etykieta widoczna w comboboxie, nazwa pliku skryptu do uruchomienia)
+    ("Filtr 1 — przykład", "filtr_1.py"),
+    ("Filtr 2 — przykład", "filtr_2.py"),
+    ("Filtr 3 — przykład", "filtr_3.py"),
 ]
-
-FILTER_TO_SCRIPT = {
-    "jeden właściciel": "jeden_właściciel.py",
-    "lokal mieszkalny": "LOKAL_MIESZKALNY.py",
-    "Jeden właściciel i Lokal mieszkalny": "jeden_właściciel_i_LOKAL_MIESZKALNY.py",
-}
-
 
 def _script_path(script_name: str) -> Path:
     """
@@ -44,8 +38,10 @@ def _script_path(script_name: str) -> Path:
                 return c.resolve()
         except Exception:
             pass
-    return candidates[0]
+    return Path(script_name)
 
+def _nice_path(p: Path | None) -> str:
+    return str(p) if p else "(nie wybrano)"
 
 class SortowniaApp:
     def __init__(self, root: tk.Tk, start_path: str | None = None):
@@ -62,11 +58,27 @@ class SortowniaApp:
 
         self._build_ui()
 
+        # Zamknięcie okna krzyżykiem -> powrót do main.py
+        self.root.protocol("WM_DELETE_WINDOW", self._back_to_main)
+
+    def _back_to_main(self):
+        """Uruchom main.py i zamknij bieżące okno."""
+        main_path = _script_path("main.py")
+        if not main_path.exists():
+            messagebox.showerror("Nie znaleziono skryptu", f"Nie mogę znaleźć pliku:\n{main_path}")
+            return
+        try:
+            subprocess.Popen([sys.executable, str(main_path)])
+        except Exception as e:
+            messagebox.showerror("Błąd uruchamiania", f"Nie udało się uruchomić main.py:\n{e}")
+            return
+        self.root.destroy()
+
     def _build_ui(self):
         # Nagłówek
         header = ttk.Frame(self.root, padding=12)
         header.pack(fill="x")
-        ttk.Button(header, text="⟵ Zamknij", command=self.root.destroy).pack(side="left")
+        ttk.Button(header, text="⟵ Zamknij", command=self._back_to_main).pack(side="left")
         ttk.Button(header, text="Wybierz plik…", command=self._choose_file).pack(side="left", padx=(8, 8))
         ttk.Label(header, text="Plik:").pack(side="left")
 
@@ -74,13 +86,22 @@ class SortowniaApp:
         ttk.Label(header, textvariable=self.path_var, width=70).pack(side="left", padx=8)
 
         # Wybór filtra
-        box = ttk.LabelFrame(self.root, text="Filtr do uruchomienia", padding=12)
-        box.pack(fill="x", padx=12, pady=(8, 0))
+        body = ttk.Frame(self.root, padding=12)
+        body.pack(fill="both", expand=True)
 
-        ttk.Label(box, text="Wybierz:").pack(side="left")
+        ttk.Label(body, text="Wybierz filtr:").pack(anchor="w")
+
+        box = ttk.Frame(body)
+        box.pack(anchor="w", pady=(6, 0))
+
         self.cmb = ttk.Combobox(
-            box, state="readonly", width=42, textvariable=self.var_selected, values=FILTER_OPTIONS
+            box,
+            textvariable=self.var_selected,
+            state="readonly",
+            width=50,
+            values=[label for (label, _) in FILTER_OPTIONS],
         )
+        self.cmb.current(0)
         self.cmb.pack(side="left", padx=8)
 
         self.btn_go = ttk.Button(box, text="Aktywuj filtr", command=self._activate)
@@ -96,72 +117,46 @@ class SortowniaApp:
 
         # Status
         status = ttk.Frame(self.root, padding=12)
-        status.pack(fill="both", expand=True)
-        self.info_var = tk.StringVar(
-            value="Wybierz plik Excela, potem filtr z listy i kliknij „Aktywuj filtr”.\n"
-                  "Możesz też użyć „poprawa_adresu” (popraw_adres.py) lub „cofnij filtry” (cofnij.py)."
-        )
-        ttk.Label(status, textvariable=self.info_var, justify="left").pack(anchor="w")
+        status.pack(fill="x", side="bottom")
+        self.msg = tk.StringVar(value="Gotowy.")
+        ttk.Label(status, textvariable=self.msg).pack(anchor="w")
 
-        try:
-            style = ttk.Style(self.root)
-            if "clam" in style.theme_names():
-                style.theme_use("clam")
-        except Exception:
-            pass
-
-    # ---- Akcje UI ----
     def _choose_file(self):
-        path = filedialog.askopenfilename(
-            title="Wybierz plik Excel",
+        fp = filedialog.askopenfilename(
+            title="Wskaż plik Excela",
             filetypes=[
-                ("Pliki Excel", "*.xlsx *.xls *.xlsm *.xlsb"),
+                ("Excel", "*.xlsx *.xlsm *.xls"),
                 ("Wszystkie pliki", "*.*"),
             ],
         )
-        if not path:
-            return
-        self.excel_path = Path(path)
-        self.path_var.set(str(self.excel_path))
+        if fp:
+            self.excel_path = Path(fp)
+            self.path_var.set(_nice_path(self.excel_path))
 
     def _activate(self):
-        """Uruchom odpowiedni skrypt z przekazaniem ścieżki do Excela."""
-        if self.excel_path is None:
-            messagebox.showwarning("Brak pliku", "Najpierw wybierz plik Excela.")
-            return
-
-        choice = self.var_selected.get()
-        script_name = FILTER_TO_SCRIPT.get(choice)
-        if not script_name:
-            messagebox.showerror("Błąd", f"Nieznana opcja: {choice}")
-            return
-
-        self._run_script(script_name)
+        idx = self.cmb.current()
+        label, script = FILTER_OPTIONS[idx]
+        self._run_selected_script(script)
 
     def _run_poprawa_adresu(self):
-        """Uruchamia popraw_adres.py z parametrem --in <plik.xlsx>."""
-        if self.excel_path is None:
-            messagebox.showwarning("Brak pliku", "Najpierw wybierz plik Excela.")
-            return
-        self._run_script("popraw_adres.py")
+        self._run_selected_script("poprawa_adresu.py")
 
     def _run_cofnij(self):
-        """Uruchamia cofnij.py z parametrem --in <plik.xlsx> (przywrócenie po filtrach)."""
-        if self.excel_path is None:
-            messagebox.showwarning("Brak pliku", "Najpierw wybierz plik Excela.")
-            return
-        self._run_script("cofnij.py")
+        self._run_selected_script("cofnij_filtry.py")
 
-    def _run_script(self, script_name: str):
-        """Wspólna logika uruchamiania zewnętrznego skryptu w nowym procesie."""
+    def _run_selected_script(self, script_name: str):
         spath = _script_path(script_name)
         if not spath.exists():
             messagebox.showerror("Nie znaleziono skryptu", f"Nie mogę znaleźć pliku:\n{spath}")
             return
-        cmd = [sys.executable, str(spath), "--in", str(self.excel_path)]
+        # budujemy polecenie
+        args = [sys.executable, str(spath)]
+        if self.excel_path:
+            args.append(str(self.excel_path))
+
         try:
-            subprocess.Popen(cmd)
-            self.info_var.set(f"Uruchomiono: {spath.name}  (plik: {self.excel_path})")
+            subprocess.Popen(args)
+            self.msg.set(f"Uruchomiono: {spath.name}")
         except Exception as e:
             messagebox.showerror("Błąd uruchamiania", f"Nie udało się uruchomić skryptu:\n{spath}\n\n{e}")
 
