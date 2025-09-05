@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Automatyczne pobranie ogłoszeń z WSZYSTKICH województw
-przy użyciu istniejących skryptów:
- - linki_mieszkania.py  --region <WOJ> --output <plik.csv>
- - scraper_otodom.py    --region <WOJ> --input <linki.csv> --output <oferty.csv>
+Automat: pobiera ogłoszenia z WSZYSTKICH województw i pobiera ich dane.
+Korzysta z:
+ - linki_mieszkania.py
+ - scraper_otodom_mieszkania.py (jeśli istnieje) lub scraper_otodom.py
 
-Uruchomienie (domyślnie wszystkie):
+Domyślnie NADPISUJE istniejące pliki (brak pomijania).
+
+Przykłady:
     python automat.py
-
-Przydatne opcje:
-    --only "Mazowieckie,Małopolskie"   # ogranicz do wybranych
-    --force                             # nadpisuj istniejące pliki
+    python automat.py --only "Mazowieckie,Małopolskie"
+    python automat.py --sleep 0.5
+    python automat.py --merge
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Iterable, List
 
-# ===== Lista województw (spójna z Twoimi skryptami GUI) =====
+# ===== Lista województw =====
 WOJEWODZTWA: List[str] = [
     "Dolnośląskie", "Kujawsko-Pomorskie", "Lubelskie", "Lubuskie",
     "Łódzkie", "Małopolskie", "Mazowieckie", "Opolskie",
@@ -32,7 +33,7 @@ WOJEWODZTWA: List[str] = [
     "Świętokrzyskie", "Warmińsko-Mazurskie", "Wielkopolskie", "Zachodniopomorskie",
 ]
 
-# ===== Ścieżki katalogów wyjściowych =====
+# ===== Ścieżki bazowe =====
 def _desktop() -> Path:
     return Path.home() / "Desktop"
 
@@ -52,17 +53,28 @@ WOJ_DIR = BASE_DIR / "województwa"
 LINKI_DIR.mkdir(parents=True, exist_ok=True)
 WOJ_DIR.mkdir(parents=True, exist_ok=True)
 
-# ===== Ścieżki do skryptów pomocniczych (w tym samym folderze co automat.py) =====
+# ===== Pliki skryptów (ten sam folder co automat.py) =====
 THIS_DIR = Path(__file__).resolve().parent
 LINKI_SCRIPT = (THIS_DIR / "linki_mieszkania.py").resolve()
-SCRAPER_SCRIPT = (THIS_DIR / "scraper_otodom.py").resolve()
+SCRAPER_MIESZ = (THIS_DIR / "scraper_otodom_mieszkania.py").resolve()
+SCRAPER_STD = (THIS_DIR / "scraper_otodom.py").resolve()
+SCALANIE = (THIS_DIR / "scalanie.py").resolve()  # opcjonalnie
+
+def _choose_scraper() -> Path:
+    # Preferuj scraper_otodom_mieszkania.py, jeśli jest
+    if SCRAPER_MIESZ.exists():
+        return SCRAPER_MIESZ
+    return SCRAPER_STD
 
 def _check_scripts() -> None:
-    missing = [p.name for p in (LINKI_SCRIPT, SCRAPER_SCRIPT) if not p.exists()]
+    missing = []
+    if not LINKI_SCRIPT.exists():
+        missing.append(LINKI_SCRIPT.name)
+    scraper = _choose_scraper()
+    if not scraper.exists():
+        missing.append(scraper.name)
     if missing:
-        raise FileNotFoundError(
-            "Brak wymaganych plików w folderze programu: " + ", ".join(missing)
-        )
+        raise FileNotFoundError("Brak wymaganych plików: " + ", ".join(missing))
 
 # ===== Utils =====
 def _log(msg: str) -> None:
@@ -74,97 +86,51 @@ def _count_csv_rows(path: Path) -> int:
         return 0
     try:
         with path.open("r", encoding="utf-8-sig", newline="") as f:
-            # bezpieczne liczenie (nie zakładamy nagłówka)
             return sum(1 for _ in csv.reader(f))
     except Exception:
-        # awaryjnie liczymy po liniach
         return sum(1 for _ in path.read_text(errors="ignore").splitlines())
 
-def _run_linki(woj: str, out_csv: Path, force: bool) -> bool:
-    """
-    Uruchamia linki_mieszkania.py dla danego województwa.
-    Zwraca True, jeśli zakończyło się poprawnie (lub pominęliśmy, bo już istnieje i nie wymuszamy).
-    """
-    if out_csv.exists() and not force:
-        _log(f"[{woj}] Linki już istnieją → pomijam (użyj --force, aby odświeżyć)")
-        return True
-
-    cmd = [sys.executable, str(LINKI_SCRIPT), "--region", woj, "--output", str(out_csv)]
-    _log(f"[{woj}] Pobieram linki…")
+def _rm_if_exists(path: Path) -> None:
     try:
-        import subprocess
-        subprocess.run(cmd, check=True)
-        n = _count_csv_rows(out_csv)
-        _log(f"[{woj}] ✔ Linki zapisane ({n} wierszy) → {out_csv}")
-        return True
-    except subprocess.CalledProcessError as e:
-        _log(f"[{woj}] ✖ Błąd pobierania linków (kod {e.returncode})")
-        return False
-    except Exception as e:
-        _log(f"[{woj}] ✖ Błąd uruchamiania linków: {e}")
-        return False
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
 
-def _run_scraper(woj: str, in_csv: Path, out_csv: Path, force: bool) -> bool:
-    """
-    Uruchamia scraper_otodom.py dla danego województwa.
-    """
-    if out_csv.exists() and not force:
-        _log(f"[{woj}] Wynik CSV już istnieje → pomijam (użyj --force, aby odświeżyć)")
-        return True
-
-    if not in_csv.exists() or _count_csv_rows(in_csv) == 0:
-        _log(f"[{woj}] Brak linków wejściowych ({in_csv}) – pomijam scraper")
-        return False
-
-    cmd = [
-        sys.executable,
-        str(SCRAPER_SCRIPT),
-        "--region", woj,
-        "--input", str(in_csv),
-        "--output", str(out_csv),
-    ]
-    _log(f"[{woj}] Pobieram szczegóły ogłoszeń…")
+def _run(cmd: list[str]) -> int:
+    import subprocess
     try:
-        import subprocess
-        subprocess.run(cmd, check=True)
-        n = _count_csv_rows(out_csv)
-        _log(f"[{woj}] ✔ Dane zapisane ({n} wierszy) → {out_csv}")
-        return True
-    except subprocess.CalledProcessError as e:
-        _log(f"[{woj}] ✖ Błąd scrapera (kod {e.returncode})")
-        return False
-    except Exception as e:
-        _log(f"[{woj}] ✖ Błąd uruchamiania scrapera: {e}")
-        return False
+        res = subprocess.run(cmd, check=False)
+        return res.returncode
+    except Exception:
+        return 999
 
 # ===== Główna pętla =====
 def _iter_wojewodztwa(only: Iterable[str] | None) -> List[str]:
     if not only:
         return WOJEWODZTWA
-    # normalizacja: usuń spacje wokół i dopasuj pełne nazwy
     wanted = {w.strip() for w in only if w.strip()}
-    # pozwalamy podać nazwę bez polskich znaków – zrobimy proste mapowanie
+
     def _norm(s: str) -> str:
         rep = str.maketrans("ąćęłńóśźżĄĆĘŁŃÓŚŹŻ", "acelnoszzACELNOSZZ")
         return s.translate(rep).lower()
 
     idx = {_norm(w): w for w in WOJEWODZTWA}
-    resolved: List[str] = []
+    out: List[str] = []
     for w in wanted:
         key = _norm(w)
         if key in idx:
-            resolved.append(idx[key])
+            out.append(idx[key])
         else:
             _log(f"⚠ Nie rozpoznano województwa: {w}")
-    return resolved
+    return out
 
 def main():
     _check_scripts()
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--only", help="Lista województw rozdzielona przecinkami (domyślnie: wszystkie).")
-    parser.add_argument("--force", action="store_true", help="Nadpisuj istniejące pliki wynikowe.")
-    parser.add_argument("--sleep", type=float, default=1.0, help="Przerwa (sekundy) między województwami.")
+    parser.add_argument("--sleep", type=float, default=1.0, help="Przerwa (s) między województwami.")
+    parser.add_argument("--merge", action="store_true", help="Po zakończeniu uruchom scalanie CSV->Excel (scalanie.py).")
     args = parser.parse_args()
 
     selected = _iter_wojewodztwa(args.only.split(",") if args.only else None)
@@ -172,28 +138,54 @@ def main():
         _log("Brak województw do przetworzenia (sprawdź parametr --only).")
         sys.exit(2)
 
+    scraper = _choose_scraper()
     _log(f"Start automatu. Katalog bazowy: {BASE_DIR}")
+    _log(f"Używany scraper: {scraper.name}")
+
     ok_cnt = 0
     for woj in selected:
         _log("=" * 64)
         linki_csv = LINKI_DIR / f"{woj}.csv"
-        oferty_csv = WOJ_DIR / f"{woj}.csv"
+        dane_csv = WOJ_DIR / f"{woj}.csv"
 
-        ok1 = _run_linki(woj, linki_csv, force=args.force)
-        ok2 = _run_scraper(woj, linki_csv, oferty_csv, force=args.force) if ok1 else False
+        # 1) Linki – zawsze od zera (nadpisz)
+        _rm_if_exists(linki_csv)
+        cmd_linki = [sys.executable, str(LINKI_SCRIPT), "--region", woj, "--output", str(linki_csv)]
+        _log(f"[{woj}] Pobieram linki…")
+        rc1 = _run(cmd_linki)
+        if rc1 != 0 or not linki_csv.exists() or _count_csv_rows(linki_csv) == 0:
+            _log(f"[{woj}] ✖ Błąd pobierania linków (kod {rc1}).")
+            continue
+        _log(f"[{woj}] ✔ Linki: {linki_csv} ({_count_csv_rows(linki_csv)} wierszy)")
 
-        if ok1 and ok2:
-            ok_cnt += 1
+        # 2) Dane – zawsze od zera (nadpisz)
+        _rm_if_exists(dane_csv)
+        cmd_scr = [
+            sys.executable, str(scraper),
+            "--region", woj,
+            "--input", str(linki_csv),
+            "--output", str(dane_csv),
+        ]
+        _log(f"[{woj}] Pobieram dane ogłoszeń…")
+        rc2 = _run(cmd_scr)
+        if rc2 != 0 or not dane_csv.exists() or _count_csv_rows(dane_csv) == 0:
+            _log(f"[{woj}] ✖ Błąd scrapera (kod {rc2}).")
+            continue
+        _log(f"[{woj}] ✔ Dane: {dane_csv} ({_count_csv_rows(dane_csv)} wierszy)")
 
+        ok_cnt += 1
         time.sleep(max(0.0, args.sleep))
 
     _log("=" * 64)
-    _log(f"Zakończono. Poprawnie przetworzonych województw: {ok_cnt}/{len(selected)}")
-    _log(f"Wyniki: {WOJ_DIR}")
-    # (opcjonalnie) tutaj możesz wywołać skrypt scalający do Excela,
-    # jeśli masz go w projekcie:
-    #   from subprocess import run
-    #   run([sys.executable, str((THIS_DIR/'scalanie.py').resolve())], check=False)
+    _log(f"Zakończono. Poprawnie przetworzone województwa: {ok_cnt}/{len(selected)}")
+    _log(f"Wyniki CSV: {WOJ_DIR}")
+
+    if args.merge:
+        if SCALANIE.exists():
+            _log("Uruchamiam scalanie CSV → Excel…")
+            _run([sys.executable, str(SCALANIE)])
+        else:
+            _log("⚠ Nie znaleziono scalanie.py – pomijam krok scalania.")
 
 if __name__ == "__main__":
     main()
