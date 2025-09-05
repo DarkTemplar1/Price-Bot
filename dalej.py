@@ -9,9 +9,9 @@ from tkinter import messagebox
 APP_TITLE = "Operacje plikowe"
 
 # Kandydaci nazw skryptów (pierwszy istniejący zostanie uruchomiony)
-SCRIPT_MAIN = ["main.py"]
 SCRIPT_BAZA = ["bazadanych.py", "bazydanych.py"]   # obsługa obu pisowni
 SCRIPT_WYNIK = ["wyniki.py", "wynik.py"]           # obsługa starej nazwy
+SCRIPT_AUTOMAT = ["automat.py"]                    # nowy przycisk "Automat"
 
 # Dozwolone rozszerzenia plików Excela (informacyjne – nie wymuszamy wyboru tutaj)
 DOZWOLONE_ROZSZERZENIA = {".xlsx", ".xls", ".xlsm", ".xlsb"}
@@ -53,17 +53,28 @@ def _launch_and_exit(script_candidates: list[str], file_arg: Path | None, root: 
         messagebox.showerror("Błąd uruchamiania", f"Nie udało się uruchomić '{script_path.name}':\n{e}", parent=root)
         return
 
+    # zamknij to okno i zakończ proces dalej.py
     try:
         root.destroy()
     finally:
-        # Bezpieczne zakończenie procesu dalej.py
+        sys.exit(0)
+
+
+def _go_back(root: tk.Tk):
+    """
+    Zachowuj się jak w sortownia.py: po prostu zamknij to okno i wyjdź.
+    (Nie uruchamiaj ponownie main.py – on już działa.)
+    """
+    try:
+        root.destroy()
+    finally:
         sys.exit(0)
 
 
 def _build_ui(selected_path: Path | None):
     root = tk.Tk()
     root.title(APP_TITLE)
-    root.geometry("560x220")
+    root.geometry("720x220")  # poszerzone, by wygodnie zmieścić 4 przyciski
     root.resizable(False, False)
 
     container = tk.Frame(root, padx=16, pady=16)
@@ -75,7 +86,7 @@ def _build_ui(selected_path: Path | None):
 
     # Ścieżka (tylko do wglądu)
     txt = str(selected_path) if selected_path else "(nie przekazano)"
-    path_label = tk.Label(container, text=txt, wraplength=520, justify="left", font=("Segoe UI", 10))
+    path_label = tk.Label(container, text=txt, wraplength=680, justify="left", font=("Segoe UI", 10))
     path_label.pack(anchor="w", pady=(4, 12))
 
     # Podpowiedź o rozszerzeniach (informacyjnie)
@@ -92,11 +103,12 @@ def _build_ui(selected_path: Path | None):
     row = tk.Frame(container)
     row.pack(fill="x", pady=8)
 
+    # ⟵ Wróć – tylko zamyka to okno (nie odpala main.py)
     btn_back = tk.Button(
         row,
         text="⟵ Wróć",
         width=20,
-        command=lambda: _launch_and_exit(SCRIPT_MAIN, selected_path, root),
+        command=lambda: _go_back(root),
     )
     btn_back.grid(row=0, column=0, padx=6, pady=6)
 
@@ -110,20 +122,27 @@ def _build_ui(selected_path: Path | None):
 
     btn_wynik = tk.Button(
         row,
-        text="Wynik",
+        text="Wynik manualne",
         width=20,
         command=lambda: _launch_and_exit(SCRIPT_WYNIK, selected_path, root),
     )
     btn_wynik.grid(row=0, column=2, padx=6, pady=6)
 
+    btn_automat = tk.Button(
+        row,
+        text="Automat",
+        width=20,
+        command=lambda: _launch_and_exit(SCRIPT_AUTOMAT, selected_path, root),
+    )
+    btn_automat.grid(row=0, column=3, padx=6, pady=6)
+
     # Podpowiedź
     tip = tk.Label(
         container,
-        text=("Przyciski zamykają to okno i uruchamiają wskazany skrypt, "
-              "przekazując tę samą ścieżkę do pliku jako pierwszy argument.\n"
-              "Obsługiwane nazwy: bazadanych.py/bazydanych.py oraz wyniki.py/wynik.py."),
+        text=("Przyciski uruchamiają wskazany skrypt (z tą samą ścieżką pliku jako 1. argument), "
+              "a bieżące okno zostaje zamknięte. 'Wróć' tylko zamyka to okno."),
         fg="#555",
-        wraplength=520,
+        wraplength=680,
         justify="left",
         font=("Segoe UI", 9),
     )

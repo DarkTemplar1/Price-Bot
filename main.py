@@ -69,18 +69,30 @@ def otworz_sortownie(sciezka_pliku: Optional[Path], root: tk.Tk):
     if not hasattr(mod, "run_modal"):
         messagebox.showerror(
             "Błąd",
-            "Plik sortownia.py nie zawiera funkcji run_modal(file_path: str | None).",
+            "Plik sortownia.py nie zawiera funkcji run_modal(parent, file_path: str | None).",
             parent=root,
         )
         return
 
-    root.withdraw()
+    # Nie ukrywamy okna głównego; sortownia otworzy się modalnie i na wierzchu
+    # (na Windows dodatkowo tymczasowo blokujemy parenta).
+    disabled_applied = False
     try:
-        mod.run_modal(str(sciezka_pliku) if sciezka_pliku else None)
+        try:
+            root.attributes("-disabled", True)  # tylko Windows, więc opakowane w try
+            disabled_applied = True
+        except tk.TclError:
+            pass
+
+        mod.run_modal(root, str(sciezka_pliku) if sciezka_pliku else None)
     except Exception as e:
         messagebox.showerror("Błąd sortowni", f"Wystąpił błąd w sortownia.py:\n{e}", parent=root)
     finally:
-        root.deiconify()
+        if disabled_applied:
+            try:
+                root.attributes("-disabled", False)
+            except tk.TclError:
+                pass
         root.lift()
         try:
             root.focus_force()
@@ -179,7 +191,6 @@ def zbuduj_okno_glowne(sciezka_pliku: Path):
 
     nonlocal_sciezka = [sciezka_pliku]
 
-    # — Nowy guzik: przygotowanie pliku (dodanie arkuszy/kolumn) —
     btn_kolumny = tk.Button(
         przyciski,
         text="przygotowanie pliku",
@@ -229,15 +240,12 @@ def start():
     def wybierz_i_przejdz():
         p = wybierz_plik_excel(root)
         if p:
-            # Bez automatycznego odpalania: od razu pokazujemy drugie menu,
-            # gdzie jest guzik „przygotowanie pliku”.
             zbuduj_okno_glowne(p)
 
     btn = tk.Button(ramka, text="Wybierz plik Excel…", width=22, command=wybierz_i_przejdz)
     btn.pack(pady=6)
 
     root.mainloop()
-
 
 
 if __name__ == "__main__":

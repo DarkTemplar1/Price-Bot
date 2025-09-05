@@ -69,33 +69,65 @@ def _error(msg: str) -> None:
     except Exception:
         print("BŁĄD:", msg, file=sys.stderr)
 
-# ===== Główna logika =====
-def _read_all_excels_from_folder(folder: Path) -> list[pd.DataFrame]:
+# ===== Wczytywanie CSV =====
+
+def _read_csv_robust(path: Path) -> pd.DataFrame:
+    """
+    Wczytuje CSV, próbując najpierw autodetekcji separatora,
+    potem kilka popularnych zestawów (encoding × sep).
+    """
+    # 1) próba autodetekcji
+    try:
+        return pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig")
+    except Exception:
+        pass
+
+    # 2) kombinacje fallback
+    encodings = ("utf-8-sig", "utf-8", "cp1250")
+    seps = (";", "|", "\t", ",")
+    last_err: Exception | None = None
+    for enc in encodings:
+        for sep in seps:
+            try:
+                return pd.read_csv(path, sep=sep, encoding=enc)
+            except Exception as e:
+                last_err = e
+                continue
+    # Jeśli wszystkie próby się nie powiodły:
+    raise last_err if last_err else RuntimeError("Nieznany błąd odczytu CSV")
+
+def _read_all_csv_from_folder(folder: Path) -> list[pd.DataFrame]:
     if not folder.exists():
         raise FileNotFoundError(f"Nie znaleziono folderu: {folder}")
 
-    files = sorted(list(folder.glob("*.xlsx")) + list(folder.glob("*.xlsm")))
+    files = sorted(folder.glob("*.csv"))
     if not files:
-        raise FileNotFoundError(f"Brak plików .xlsx/.xlsm w {folder}")
+        raise FileNotFoundError(f"Brak plików .csv w {folder}")
 
     frames: list[pd.DataFrame] = []
     for f in files:
         try:
-            xl = pd.ExcelFile(f, engine="openpyxl")
-            for sh in xl.sheet_names:
-                df = xl.parse(sh)
-                # pomiń całkiem puste
-                if df.empty or all(c is None for c in df.columns):
-                    continue
-                # usuń wiersze kompletnie puste
-                df = df.dropna(how="all")
-                if df.empty:
-                    continue
-                frames.append(df)
+            df = _read_csv_robust(f)
+
+            # pomiń całkiem puste
+            if df.empty or all(c is None for c in df.columns):
+                continue
+
+            # usuń wiersze kompletnie puste
+            df = df.dropna(how="all")
+            if df.empty:
+                continue
+
+            # jeżeli brak kolumny 'wojewodztwo', uzupełnij nazwą pliku
+            if "wojewodztwo" not in df.columns:
+                df["wojewodztwo"] = f.stem
+
+            frames.append(df)
         except Exception as e:
             _error(f"Nie udało się wczytać pliku: {f.name}\n{e}")
     return frames
 
+# ===== Ujednolicanie kolumn i zapis =====
 def _unify_columns(frames: list[pd.DataFrame]) -> pd.DataFrame:
     if not frames:
         return pd.DataFrame()
@@ -133,9 +165,9 @@ def _unify_columns(frames: list[pd.DataFrame]) -> pd.DataFrame:
 
 def main():
     try:
-        frames = _read_all_excels_from_folder(SRC_DIR)
+        frames = _read_all_csv_from_folder(SRC_DIR)
         if not frames:
-            _error("Nie znaleziono arkuszy z danymi w plikach źródłowych.")
+            _error("Nie znaleziono danych w plikach źródłowych CSV.")
             sys.exit(2)
 
         df = _unify_columns(frames)
@@ -143,7 +175,7 @@ def main():
             _error("Po scaleniu nie ma żadnych danych do zapisania.")
             sys.exit(3)
 
-        # zapis
+        # zapis do Excela
         DST_FILE.parent.mkdir(parents=True, exist_ok=True)
         with pd.ExcelWriter(DST_FILE, engine="openpyxl", mode="w") as wr:
             df.to_excel(wr, sheet_name=DST_SHEET, index=False)

@@ -1,205 +1,199 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import re
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+"""
+Automatyczne pobranie ogłoszeń z WSZYSTKICH województw
+przy użyciu istniejących skryptów:
+ - linki_mieszkania.py  --region <WOJ> --output <plik.csv>
+ - scraper_otodom.py    --region <WOJ> --input <linki.csv> --output <oferty.csv>
+
+Uruchomienie (domyślnie wszystkie):
+    python automat.py
+
+Przydatne opcje:
+    --only "Mazowieckie,Małopolskie"   # ogranicz do wybranych
+    --force                             # nadpisuj istniejące pliki
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import sys
+import time
 from pathlib import Path
-from openpyxl import load_workbook
+from typing import Iterable, List
 
-APP_TITLE = "testy0703 — Uzupełnianie z TERYT.xlsx"
-TERYT_DEFAULT = "TERYT.xlsx"
+# ===== Lista województw (spójna z Twoimi skryptami GUI) =====
+WOJEWODZTWA: List[str] = [
+    "Dolnośląskie", "Kujawsko-Pomorskie", "Lubelskie", "Lubuskie",
+    "Łódzkie", "Małopolskie", "Mazowieckie", "Opolskie",
+    "Podkarpackie", "Podlaskie", "Pomorskie", "Śląskie",
+    "Świętokrzyskie", "Warmińsko-Mazurskie", "Wielkopolskie", "Zachodniopomorskie",
+]
 
-# --- normalizacja ---
-DIAC_MAP = str.maketrans({
-    "ą":"a","ć":"c","ę":"e","ł":"l","ń":"n","ó":"o","ś":"s","ź":"z","ż":"z",
-    "Ą":"A","Ć":"C","Ę":"E","Ł":"L","Ń":"N","Ó":"O","Ś":"S","Ź":"Z","Ż":"Z",
-})
-def norm_key(s: str) -> str:
-    if s is None: return ""
-    s = str(s).strip().lower()
-    s = re.sub(r"^(wojew[oó]dztwo|woj\.)\s+", "", s)  # usuń "województwo " / "woj. "
-    return s.translate(DIAC_MAP)
+# ===== Ścieżki katalogów wyjściowych =====
+def _desktop() -> Path:
+    return Path.home() / "Desktop"
 
-# --- stara->nowa nazwa województwa (klucze znormalizowane) ---
-OLD_TO_NEW_VOIV_RAW = {
-    "białostockie": "podlaskie","bielskie": "śląskie","bydgoskie": "kujawsko-pomorskie",
-    "chełmskie": "lubelskie","ciechanowskie": "mazowieckie","częstochowskie": "śląskie",
-    "elbląskie": "warmińsko-mazurskie","gdańskie": "pomorskie","gorzowskie": "lubuskie",
-    "jeleniogórskie": "dolnośląskie","kaliskie": "wielkopolskie","katowickie": "śląskie",
-    "kieleckie": "świętokrzyskie","koszalińskie": "zachodniopomorskie","krakowskie": "małopolskie",
-    "krośnieńskie": "podkarpackie","legnickie": "dolnośląskie","leszczyńskie": "wielkopolskie",
-    "łomżyńskie": "podlaskie","nowosądeckie": "małopolskie","olsztyńskie": "warmińsko-mazurskie",
-    "opole": "opolskie","ostrołęckie": "mazowieckie","piotrkowskie": "łódzkie",
-    "płockie": "mazowieckie","poznańskie": "wielkopolskie","przemyskie": "podkarpackie",
-    "radomskie": "mazowieckie","rzeszowskie": "podkarpackie","siedleckie": "mazowieckie",
-    "sieradzkie": "łódzkie","skierniewickie": "łódzkie","słupskie": "pomorskie",
-    "suwałskie": "podlaskie","szczecińskie": "zachodniopomorskie","tarnobrzeskie": "podkarpackie",
-    "tarnowskie": "małopolskie","toruńskie": "kujawsko-pomorskie","wałbrzyskie": "dolnośląskie",
-    "warszawskie": "mazowieckie","włocławskie": "kujawsko-pomorskie","wrocławskie": "dolnośląskie",
-    "zamojsko-chełmskie": "lubelskie","zielonogórskie": "lubuskie"
-}
-OLD_TO_NEW_VOIV = {norm_key(k): v for k, v in OLD_TO_NEW_VOIV_RAW.items()}
+def _base_dir() -> Path:
+    d = _desktop()
+    for name in ("baza danych", "Baza danych"):
+        p = d / name
+        if p.exists():
+            return p
+    p = d / "baza danych"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
-def map_old_voiv(name: str) -> str:
-    n = norm_key(name)
-    return OLD_TO_NEW_VOIV.get(n, name)
+BASE_DIR = _base_dir()
+LINKI_DIR = BASE_DIR / "linki"
+WOJ_DIR = BASE_DIR / "województwa"
+LINKI_DIR.mkdir(parents=True, exist_ok=True)
+WOJ_DIR.mkdir(parents=True, exist_ok=True)
 
-# --- TERYT wczytanie ---
-def load_teryt(path):
-    wb = load_workbook(path, data_only=True)
-    ws = wb["TERYT"] if "TERYT" in wb.sheetnames else wb.active
-    headers = {str(c.value).strip(): i for i, c in enumerate(ws[1], start=1) if c.value}
-    req = ["Województwo","Powiat","Gmina","Miejscowość","Dzielnica"]
-    for r in req:
-        if r not in headers:
-            raise RuntimeError(f"Brak kolumny '{r}' w {path}")
-    rows = []
-    for r in range(2, ws.max_row+1):
-        rows.append({k: (ws.cell(row=r, column=headers[k]).value or "") for k in req})
-    return rows
+# ===== Ścieżki do skryptów pomocniczych (w tym samym folderze co automat.py) =====
+THIS_DIR = Path(__file__).resolve().parent
+LINKI_SCRIPT = (THIS_DIR / "linki_mieszkania.py").resolve()
+SCRAPER_SCRIPT = (THIS_DIR / "scraper_otodom.py").resolve()
 
-# --- dopasowania ---
-def filter_candidates(teryt_rows, w=None, p=None, g=None, m=None, d=None):
-    w = norm_key(map_old_voiv(w)) if w else ""
-    p = norm_key(p) if p else ""
-    g = norm_key(g) if g else ""
-    m = norm_key(m) if m else ""
-    d = norm_key(d) if d else ""
-    out = []
-    for rec in teryt_rows:
-        ok = True
-        if w and norm_key(rec["Województwo"]) != w: ok = False
-        if p and norm_key(rec["Powiat"]) != p: ok = False
-        if g and norm_key(rec["Gmina"]) != g: ok = False
-        if m and norm_key(rec["Miejscowość"]) != m: ok = False
-        if d and norm_key(rec["Dzielnica"]) != d: ok = False
-        if ok: out.append(rec)
-    return out
+def _check_scripts() -> None:
+    missing = [p.name for p in (LINKI_SCRIPT, SCRAPER_SCRIPT) if not p.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Brak wymaganych plików w folderze programu: " + ", ".join(missing)
+        )
 
-def stable_values(cands):
-    fields = ["Województwo","Powiat","Gmina","Miejscowość","Dzielnica"]
-    out = {}
-    for f in fields:
-        vals = {rec[f] for rec in cands if str(rec[f]).strip() != ""}
-        if len(vals) == 1:
-            out[f] = next(iter(vals))
-    return out
+# ===== Utils =====
+def _log(msg: str) -> None:
+    ts = time.strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
 
-# --- GUI ---
-class App(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title(APP_TITLE)
-        self.geometry("980x600")
-        self.teryt_path = tk.StringVar(value=TERYT_DEFAULT if Path(TERYT_DEFAULT).exists() else "")
-        top = tk.Frame(self); top.pack(fill="x", padx=10, pady=6)
-        tk.Label(top, text="TERYT.xlsx:").pack(side="left")
-        tk.Entry(top, textvariable=self.teryt_path, width=60).pack(side="left", padx=6)
-        tk.Button(top, text="Wybierz…", command=self.pick_teryt).pack(side="left")
-        self.n_rows_var = tk.StringVar(value="5")
-        tk.Label(top, text="Ilość wierszy:").pack(side="left", padx=(20,4))
-        tk.Entry(top, textvariable=self.n_rows_var, width=5).pack(side="left")
-        tk.Button(top, text="Generuj pola", command=self.gen_rows).pack(side="left", padx=8)
-        tk.Button(top, text="Sprawdzam (uzupełnij z TERYT)", command=self.check_and_fill).pack(side="right")
-        self.canvas = tk.Canvas(self, borderwidth=0)
-        self.frame = tk.Frame(self.canvas)
-        self.scroll = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=self.scroll.set)
-        self.scroll.pack(side="right", fill="y")
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self.canvas_frame = self.canvas.create_window((0,0), window=self.frame, anchor="nw")
-        self.frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.bind("<Configure>", self._on_canvas_configure)
-        headers = ["Województwo","Powiat","Gmina","Miejscowość","Dzielnica"]
-        self.entries = []
-        head = tk.Frame(self.frame); head.pack(fill="x")
-        for i, h in enumerate(headers):
-            tk.Label(head, text=h, font=("TkDefaultFont", 10, "bold"), width=22, anchor="w").grid(row=0, column=i, padx=4, pady=4, sticky="w")
-        self.rows_container = tk.Frame(self.frame); self.rows_container.pack(fill="both", expand=True)
-        self.gen_rows()
+def _count_csv_rows(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as f:
+            # bezpieczne liczenie (nie zakładamy nagłówka)
+            return sum(1 for _ in csv.reader(f))
+    except Exception:
+        # awaryjnie liczymy po liniach
+        return sum(1 for _ in path.read_text(errors="ignore").splitlines())
 
-    def _on_canvas_configure(self, event):
-        self.canvas.itemconfig(self.canvas_frame, width=event.width)
+def _run_linki(woj: str, out_csv: Path, force: bool) -> bool:
+    """
+    Uruchamia linki_mieszkania.py dla danego województwa.
+    Zwraca True, jeśli zakończyło się poprawnie (lub pominęliśmy, bo już istnieje i nie wymuszamy).
+    """
+    if out_csv.exists() and not force:
+        _log(f"[{woj}] Linki już istnieją → pomijam (użyj --force, aby odświeżyć)")
+        return True
 
-    def pick_teryt(self):
-        path = filedialog.askopenfilename(title="Wskaż TERYT.xlsx", filetypes=[("Excel","*.xlsx")])
-        if path:
-            self.teryt_path.set(path)
+    cmd = [sys.executable, str(LINKI_SCRIPT), "--region", woj, "--output", str(out_csv)]
+    _log(f"[{woj}] Pobieram linki…")
+    try:
+        import subprocess
+        subprocess.run(cmd, check=True)
+        n = _count_csv_rows(out_csv)
+        _log(f"[{woj}] ✔ Linki zapisane ({n} wierszy) → {out_csv}")
+        return True
+    except subprocess.CalledProcessError as e:
+        _log(f"[{woj}] ✖ Błąd pobierania linków (kod {e.returncode})")
+        return False
+    except Exception as e:
+        _log(f"[{woj}] ✖ Błąd uruchamiania linków: {e}")
+        return False
 
-    def _clear_rows(self):
-        for w in self.rows_container.winfo_children():
-            w.destroy()
-        self.entries.clear()
+def _run_scraper(woj: str, in_csv: Path, out_csv: Path, force: bool) -> bool:
+    """
+    Uruchamia scraper_otodom.py dla danego województwa.
+    """
+    if out_csv.exists() and not force:
+        _log(f"[{woj}] Wynik CSV już istnieje → pomijam (użyj --force, aby odświeżyć)")
+        return True
 
-    def gen_rows(self):
-        try:
-            n = int(self.n_rows_var.get())
-            n = max(1, min(500, n))
-        except Exception:
-            messagebox.showwarning("Uwaga", "Podaj poprawną liczbę wierszy (1–500).")
-            return
-        self._clear_rows()
-        for _ in range(n):
-            rowf = tk.Frame(self.rows_container)
-            rowf.pack(fill="x", padx=4, pady=2)
-            row_entries = []
-            for _c in range(5):
-                e = tk.Entry(rowf, width=24)
-                e.grid(row=0, column=_c, padx=4, pady=2, sticky="w")
-                row_entries.append(e)
-            self.entries.append(row_entries)
+    if not in_csv.exists() or _count_csv_rows(in_csv) == 0:
+        _log(f"[{woj}] Brak linków wejściowych ({in_csv}) – pomijam scraper")
+        return False
 
-    def check_and_fill(self):
-        path = self.teryt_path.get()
-        if not path or not Path(path).exists():
-            messagebox.showerror("Błąd", "Wskaż plik TERYT.xlsx.")
-            return
-        try:
-            trows = load_teryt(path)
-        except Exception as e:
-            messagebox.showerror("Błąd", f"Nie udało się wczytać TERYT.xlsx: {e}")
-            return
+    cmd = [
+        sys.executable,
+        str(SCRAPER_SCRIPT),
+        "--region", woj,
+        "--input", str(in_csv),
+        "--output", str(out_csv),
+    ]
+    _log(f"[{woj}] Pobieram szczegóły ogłoszeń…")
+    try:
+        import subprocess
+        subprocess.run(cmd, check=True)
+        n = _count_csv_rows(out_csv)
+        _log(f"[{woj}] ✔ Dane zapisane ({n} wierszy) → {out_csv}")
+        return True
+    except subprocess.CalledProcessError as e:
+        _log(f"[{woj}] ✖ Błąd scrapera (kod {e.returncode})")
+        return False
+    except Exception as e:
+        _log(f"[{woj}] ✖ Błąd uruchamiania scrapera: {e}")
+        return False
 
-        updated = 0
-        for row_entries in self.entries:
-            w, p, g, m, d = [e.get().strip() for e in row_entries]
+# ===== Główna pętla =====
+def _iter_wojewodztwa(only: Iterable[str] | None) -> List[str]:
+    if not only:
+        return WOJEWODZTWA
+    # normalizacja: usuń spacje wokół i dopasuj pełne nazwy
+    wanted = {w.strip() for w in only if w.strip()}
+    # pozwalamy podać nazwę bez polskich znaków – zrobimy proste mapowanie
+    def _norm(s: str) -> str:
+        rep = str.maketrans("ąćęłńóśźżĄĆĘŁŃÓŚŹŻ", "acelnoszzACELNOSZZ")
+        return s.translate(rep).lower()
 
-            # 0) od razu zamień starą nazwę woj. w polu (jeśli trzeba)
-            if w:
-                mapped = map_old_voiv(w)
-                if mapped != w:
-                    row_entries[0].delete(0, "end"); row_entries[0].insert(0, mapped)
-                    w = mapped  # aktualny tekst w polu
+    idx = {_norm(w): w for w in WOJEWODZTWA}
+    resolved: List[str] = []
+    for w in wanted:
+        key = _norm(w)
+        if key in idx:
+            resolved.append(idx[key])
+        else:
+            _log(f"⚠ Nie rozpoznano województwa: {w}")
+    return resolved
 
-            # A: pełne filtry
-            cands = filter_candidates(trows, w, p, g, m, d)
-            # B: woj + miejscowość
-            if not cands and (w or m):
-                cands = filter_candidates(trows, w, None, None, m, None)
-            # C: sama miejscowość
-            if not cands and m:
-                cands = filter_candidates(trows, None, None, None, m, None)
-            # D: sama gmina
-            if not cands and g:
-                cands = filter_candidates(trows, None, None, g, None, None)
+def main():
+    _check_scripts()
 
-            if len(cands) == 1:
-                # === ZAMIANA: nadpisz WSZYSTKIE pola kanonicznymi wartościami ===
-                rec = cands[0]
-                vals = [rec["Województwo"], rec["Powiat"], rec["Gmina"], rec["Miejscowość"], rec["Dzielnica"]]
-                for e, v in zip(row_entries, vals):
-                    e.delete(0, "end"); e.insert(0, str(v))
-                updated += 1
-            elif len(cands) > 1:
-                # === ZAMIANA TYLKO JEDNOZNACZNYCH PÓL (wspólne dla wszystkich kandydatów) ===
-                stab = stable_values(cands)
-                changed = False
-                for (e, key) in zip(row_entries, ["Województwo","Powiat","Gmina","Miejscowość","Dzielnica"]):
-                    if key in stab:
-                        e.delete(0, "end"); e.insert(0, str(stab[key])); changed = True
-                if changed:
-                    updated += 1
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--only", help="Lista województw rozdzielona przecinkami (domyślnie: wszystkie).")
+    parser.add_argument("--force", action="store_true", help="Nadpisuj istniejące pliki wynikowe.")
+    parser.add_argument("--sleep", type=float, default=1.0, help="Przerwa (sekundy) między województwami.")
+    args = parser.parse_args()
 
-        messagebox.showinfo("Zakończono", f"Uzupełniono {updated} wierszy (w całości lub częściowo).")
+    selected = _iter_wojewodztwa(args.only.split(",") if args.only else None)
+    if not selected:
+        _log("Brak województw do przetworzenia (sprawdź parametr --only).")
+        sys.exit(2)
+
+    _log(f"Start automatu. Katalog bazowy: {BASE_DIR}")
+    ok_cnt = 0
+    for woj in selected:
+        _log("=" * 64)
+        linki_csv = LINKI_DIR / f"{woj}.csv"
+        oferty_csv = WOJ_DIR / f"{woj}.csv"
+
+        ok1 = _run_linki(woj, linki_csv, force=args.force)
+        ok2 = _run_scraper(woj, linki_csv, oferty_csv, force=args.force) if ok1 else False
+
+        if ok1 and ok2:
+            ok_cnt += 1
+
+        time.sleep(max(0.0, args.sleep))
+
+    _log("=" * 64)
+    _log(f"Zakończono. Poprawnie przetworzonych województw: {ok_cnt}/{len(selected)}")
+    _log(f"Wyniki: {WOJ_DIR}")
+    # (opcjonalnie) tutaj możesz wywołać skrypt scalający do Excela,
+    # jeśli masz go w projekcie:
+    #   from subprocess import run
+    #   run([sys.executable, str((THIS_DIR/'scalanie.py').resolve())], check=False)
 
 if __name__ == "__main__":
-    App().mainloop()
+    main()
