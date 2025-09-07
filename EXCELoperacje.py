@@ -43,7 +43,7 @@ ADDRESS_COLUMNS_ORDER: list[str] = [
     "Czy udziały ?",
 ]
 
-# kolumny dla bazy „Baza_danych.xlsx” / arkusza „Mieszkania”
+# kolumny dla bazy „Baza danych.xlsx” / arkusza „Mieszkania”
 BAZA_MIESZKANIA_HEADERS: list[str] = [
     "cena",
     "cena_za_metr",
@@ -447,6 +447,6 @@ def ensure_baza_mieszkania(file_path: Path, sheet: str = "Mieszkania") -> None:
 
 def append_mieszkania_rows(file_path: Path, rows: Iterable[dict], sheet: str = "Mieszkania") -> None:
     """
-    Dopisz rekordy ogłoszeń do arkusza 'Mieszkania' w 'Baza_danych.xlsx'.
+    Dopisz rekordy ogłoszeń do arkusza 'Mieszkania' w 'Baza danych.xlsx'.
     """
     append_rows_dicts(file_path, sheet, rows, BAZA_MIESZKANIA_HEADERS)

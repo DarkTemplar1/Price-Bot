@@ -71,7 +71,6 @@ def ensure_base_dirs() -> Path:
 
 # --------------------- CSV helpery -----------------------
 def _ensure_csv(path: Path, header: List[str]) -> bool:
-    """Utwórz CSV z podanym nagłówkiem (UTF-8 BOM dla Excela), jeżeli nie istnieje."""
     if path.exists():
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -82,13 +81,6 @@ def _ensure_csv(path: Path, header: List[str]) -> bool:
     return True
 
 def create_voivodeship_csvs(base: Path) -> dict:
-    """
-    Tworzy pliki dla KAŻDEGO województwa:
-      • linki/<Etykieta>.csv          (nagłówek: ["link"])
-      • województwa/<Etykieta>.csv    (nagłówek: WYNIKI_HEADER)
-    Niczego nie nadpisuje – tylko jeśli brak.
-    Zwraca liczbę nowych plików.
-    """
     created = {"linki": 0, "województwa": 0}
     linki_dir = base / "linki"
     woj_dir = base / "województwa"
@@ -109,25 +101,32 @@ def _ensure_base_headers(ws) -> None:
     for col in REQ_COLS:
         if col not in existing:
             ws.cell(row=1, column=ws.max_column + 1, value=col)
-            existing.append(col)
 
-def _ensure_value_cols_after_anchor(ws, anchor="Czy udziały?") -> None:
+def _ensure_value_cols_create_if_missing(ws, anchor: str = "Czy udziały?") -> None:
+    """
+    Sprawdza, czy kolumny VALUE_COLS już istnieją (gdziekolwiek w wierszu nagłówków).
+    - Jeśli istnieją, nic nie dodaje (brak duplikatów).
+    - Jeśli którejś brakuje, DODAJE brakujące kolumny tuż za kolumną 'anchor'
+      i ustawia ich nagłówki w kolejności z VALUE_COLS.
+    """
     headers = [cell.value or "" for cell in ws[1]]
-    if anchor not in headers:
+
+    if anchor in headers:
+        anchor_idx = headers.index(anchor) + 1  # 1-based
+    else:
         ws.cell(row=1, column=ws.max_column + 1, value=anchor)
-        headers = [cell.value or "" for cell in ws[1]]
-    anchor_idx = headers.index(anchor) + 1  # 1-based
-    want = VALUE_COLS
-    ok = True
-    for offset, name in enumerate(want, start=1):
-        cell_val = ws.cell(row=1, column=anchor_idx + offset).value
-        if cell_val != name:
-            ok = False
-            break
-    if ok:
+        anchor_idx = ws.max_column  # nowy anchor dodany na końcu
+
+    # odśwież listę nagłówków po ewentualnym dodaniu anchor
+    headers = [cell.value or "" for cell in ws[1]]
+    existing = set(headers)
+
+    missing = [name for name in VALUE_COLS if name not in existing]
+    if not missing:
         return
-    ws.insert_cols(anchor_idx + 1, amount=3)
-    for i, name in enumerate(want, start=1):
+
+    ws.insert_cols(anchor_idx + 1, amount=len(missing))
+    for i, name in enumerate(missing, start=1):
         ws.cell(row=1, column=anchor_idx + i, value=name)
 
 def ensure_sheet_and_columns(xlsx_path: Path) -> None:
@@ -139,7 +138,7 @@ def ensure_sheet_and_columns(xlsx_path: Path) -> None:
     for sheet_name in (RAPORT_SHEET, RAPORT_ODF):
         ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.create_sheet(sheet_name)
         _ensure_base_headers(ws)
-        _ensure_value_cols_after_anchor(ws, anchor="Czy udziały?")
+        _ensure_value_cols_create_if_missing(ws, anchor="Czy udziały?")
     wb.save(xlsx_path)
 
 def pick_file_via_gui() -> Path:
@@ -168,21 +167,18 @@ def error(msg: str) -> None:
         print("BŁĄD:", msg, file=sys.stderr)
 
 def main():
-    # 1) Tworzenie struktury folderów
     try:
         base_dir = ensure_base_dirs()
     except Exception as e:
         error(f"Nie udało się utworzyć folderów na Pulpicie/Desktop:\n{e}")
         raise SystemExit(3)
 
-    # 1a) NOWE: załóż z góry CSV dla wszystkich województw (linki + województwa) wg ETYKIET
     try:
         created = create_voivodeship_csvs(base_dir)
     except Exception as e:
         error(f"Nie udało się utworzyć plików CSV dla województw:\n{e}")
         raise SystemExit(4)
 
-    # 2) Wybór/obsługa pliku Excel
     if len(sys.argv) >= 2:
         xlsx_path = Path(sys.argv[1])
     else:
@@ -195,7 +191,7 @@ def main():
     try:
         ensure_sheet_and_columns(xlsx_path)
         info(
-            "Przygotowano arkusze 'raport' i 'raport_odfiltrowane' oraz dodano kolumny za 'Czy udziały?'\n"
+            "Przygotowano arkusze 'raport' i 'raport_odfiltrowane' oraz dodano brakujące kolumny za 'Czy udziały?'\n"
             f"Plik: {xlsx_path}\n\n"
             "Utworzono/zweryfikowano również strukturę folderów i CSV per województwo (etykiety):\n"
             f"• {base_dir/'linki'} — nowych plików: {created.get('linki',0)}\n"

@@ -1,300 +1,338 @@
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
+from __future__ import annotations
+
 import argparse
-import re
 import sys
+from typing import List, Dict, Any, Optional
+import pandas as pd
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
 
-import tkinter as tk
-from tkinter import messagebox
-
-from openpyxl import load_workbook, Workbook
-
-APP_TITLE = "popraw_adres – automatyczne uzupełnianie adresów"
-
-TERYT_DEFAULT = "TERYT.xlsx"
-NR_KW_DEFAULT = "Nr KW.xlsx"
-
-# ========================= pomocnicze =========================
-
-DIAC_MAP = str.maketrans({
-    "ą":"a","ć":"c","ę":"e","ł":"l","ń":"n","ó":"o","ś":"s","ź":"z","ż":"z",
-    "Ą":"A","Ć":"C","Ę":"E","Ł":"L","Ń":"N","Ó":"O","Ś":"S","Ź":"Z","Ż":"Z",
-})
-
-def norm_key(s: str) -> str:
-    if s is None: return ""
-    s = str(s).strip().lower()
-    s = re.sub(r"^(wojew[oó]dztwo|woj\.)\s+", "", s)  # usuń "województwo " / "woj. "
-    return s.translate(DIAC_MAP)
-
-def _info(msg: str):
-    try:
-        r = tk.Tk(); r.withdraw()
-        messagebox.showinfo("Informacja", msg, parent=r)
-        r.destroy()
-    except Exception:
-        print(msg)
-
-def _err(msg: str):
-    try:
-        r = tk.Tk(); r.withdraw()
-        messagebox.showerror("Błąd", msg, parent=r)
-        r.destroy()
-    except Exception:
-        print("BŁĄD:", msg, file=sys.stderr)
-
-# ========================= TERYT ==============================
-
-def load_teryt(path: Path) -> List[Dict[str, str]]:
-    wb = load_workbook(path, data_only=True)
-    ws = wb["TERYT"] if "TERYT" in wb.sheetnames else wb.active
-    headers = {str(c.value).strip(): i for i, c in enumerate(ws[1], start=1) if c.value}
-    req = ["Województwo","Powiat","Gmina","Miejscowość","Dzielnica"]
-    for r in req:
-        if r not in headers:
-            raise RuntimeError(f"Brak kolumny '{r}' w {path}")
-    rows = []
-    for r in range(2, ws.max_row+1):
-        rows.append({k: (ws.cell(row=r, column=headers[k]).value or "") for k in req})
-    return rows
-
-def filter_candidates(teryt_rows, w=None, p=None, g=None, m=None, d=None):
-    w = norm_key(w) if w else ""
-    p = norm_key(p) if p else ""
-    g = norm_key(g) if g else ""
-    m = norm_key(m) if m else ""
-    d = norm_key(d) if d else ""
-    out = []
-    for rec in teryt_rows:
-        ok = True
-        if w and norm_key(rec["Województwo"]) != w: ok = False
-        if p and norm_key(rec["Powiat"]) != p: ok = False
-        if g and norm_key(rec["Gmina"]) != g: ok = False
-        if m and norm_key(rec["Miejscowość"]) != m: ok = False
-        if d and norm_key(rec["Dzielnica"]) != d: ok = False
-        if ok: out.append(rec)
-    return out
-
-def stable_values(cands):
-    fields = ["Województwo","Powiat","Gmina","Miejscowość","Dzielnica"]
-    out = {}
-    for f in fields:
-        vals = {rec[f] for rec in cands if str(rec[f]).strip() != ""}
-        if len(vals) == 1:
-            out[f] = next(iter(vals))
-    return out
-
-# ===================== Nr KW.xlsx (prefiks→woj.) =====================
-
-def _strip_accents_lower(s: str) -> str:
-    return (s or "").translate(DIAC_MAP).lower().strip()
-
-def load_kw_voiv_mapping(path: Path) -> Dict[str, str]:
-    """
-    Odczytuje mapę prefiksu (pierwsze 4 znaki z Nr KW) → Województwo.
-    Obsługa elastyczna nagłówków:
-    - prefiks: jeden z ['prefiks','prefix','kod','kod sadu','kod sądu','oznaczenie','nr kw','nr_kw','wydzial']
-    - województwo: nagłówek zawierający 'woj' (po usunięciu polskich znaków)
-    Jeśli nie znajdzie nagłówków, a są co najmniej 2 kolumny — używa kolumn (1→prefiks, 2→woj.).
-    """
-    wb = load_workbook(path, data_only=True)
-    ws = wb.active
-    if ws.max_row < 2:
-        return {}
-    # spróbuj zidentyfikować kolumny po nagłówkach
-    pref_cand = {"prefiks","prefix","kod","kod sadu","kod sądu","oznaczenie","nr kw","nr_kw","wydzial","wydział"}
-    headers = [str(c.value).strip() if c.value else "" for c in ws[1]]
-    pref_col = None
-    woj_col = None
-    for i, h in enumerate(headers, start=1):
-        hnorm = _strip_accents_lower(h)
-        if pref_col is None and hnorm in pref_cand:
-            pref_col = i
-        if woj_col is None and "woj" in hnorm:
-            woj_col = i
-    if pref_col is None or woj_col is None:
-        # fallback: pierwsze dwie kolumny
-        pref_col, woj_col = 1, 2
-
-    out = {}
-    for r in range(2, ws.max_row+1):
-        pref = ws.cell(row=r, column=pref_col).value
-        woj = ws.cell(row=r, column=woj_col).value
-        if pref is None or woj is None:
-            continue
-        key = str(pref).strip().upper()
-        if not key:
-            continue
-        out[key] = str(woj).strip()
-    return out
-
-def kw_prefix(nr_kw: str) -> str:
-    if not nr_kw:
-        return ""
-    # pierwsze 4 alfanumeryczne znaki
-    cleaned = "".join(ch for ch in str(nr_kw).strip() if ch.isalnum())
-    return cleaned[:4].upper()
-
-# =================== obsługa Excela z raportem ===================
-
-ADDR_COLS = ["Województwo","Powiat","Gmina","Miejscowość","Dzielnica"]
-VALUE_COLS = [
-    "Średnia cena za m² (z bazy)",
-    "Średnia skorygowana cena za m² (z bazy)",
-    "Statystyczna wartość nieruchomości",
+COL_NR_KW = "Nr KW"
+ADDR_COLS = ["Województwo", "Powiat", "Gmina", "Miejscowość", "Dzielnica", "Ulica"]
+PRICE_COLS = [
+    "Średnia cena za m2 ( z bazy)",
+    "Średnia skorygowana cena za m2",
+    "Statyczna wartość nieruchomości",
 ]
-KW_COL = "Nr KW"
 
-def find_or_create_column(ws, header: str) -> int:
-    """Zwróć indeks kolumny dla nagłówka; jeśli nie ma — dodaj na końcu."""
-    headers = [str(c.value).strip() if c.value else "" for c in ws[1]]
-    for idx, h in enumerate(headers, start=1):
-        if h == header:
-            return idx
-    col = len(headers) + 1
-    ws.cell(row=1, column=col, value=header)
-    return col
+# —————————————————— Wbudowane mapowanie starych/błędnych nazw → nowe ——————————————————
+# klucze po lewej są normalizowane (casefold, bez zbędnych spacji), wartości po prawej to pożądana forma
+# Sekcja "global" działa dla wszystkich kolumn adresowych, sekcja per-kolumna — tylko w tej kolumnie.
+BUILTIN_NAME_MAP: Dict[Optional[str], Dict[str, str]] = {
+    None: {  # globalnie (miasta — korekta polskich znaków i popularnych zapisów)
+        "lodz": "Łódź",
+        "krakow": "Kraków",
+        "poznan": "Poznań",
+        "wroclaw": "Wrocław",
+        "bialystok": "Białystok",
+        "radom": "Radom",
+        "szczecin": "Szczecin",
+        "zielona gora": "Zielona Góra",
+        "gorzow wlkp.": "Gorzów Wielkopolski",
+        "gorzow wielkopolski": "Gorzów Wielkopolski",
+        "koszalin": "Koszalin",
+        "bielsko biala": "Bielsko-Biała",
+        "warszawa": "Warszawa",
+        "gdansk": "Gdańsk",
+        "gdynia": "Gdynia",
+        "sopot": "Sopot",
+        "rzeszow": "Rzeszów",
+        "olsztyn": "Olsztyn",
+        "torun": "Toruń",
+        "bydgoszcz": "Bydgoszcz",
+        "katowice": "Katowice",
+        "opole": "Opole",
+        "kielce": "Kielce",
+        "biala podlaska": "Biała Podlaska",
+        "nowy sacz": "Nowy Sącz",
+    },
+    "Województwo": {  # poprawne nazwy województw
+        "dolnoslaskie": "Dolnośląskie",
+        "kujawsko pomorskie": "Kujawsko-Pomorskie",
+        "kujawsko-pomorskie": "Kujawsko-Pomorskie",
+        "lubelskie": "Lubelskie",
+        "lubuskie": "Lubuskie",
+        "lodzkie": "Łódzkie",
+        "malopolskie": "Małopolskie",
+        "mazowieckie": "Mazowieckie",
+        "opolskie": "Opolskie",
+        "podkarpackie": "Podkarpackie",
+        "podlaskie": "Podlaskie",
+        "pomorskie": "Pomorskie",
+        "slaskie": "Śląskie",
+        "swietokrzyskie": "Świętokrzyskie",
+        "warminsko mazurskie": "Warmińsko-Mazurskie",
+        "warminsko-mazurskie": "Warmińsko-Mazurskie",
+        "wielkopolskie": "Wielkopolskie",
+        "zachodniopomorskie": "Zachodniopomorskie",
+    },
+    "Dzielnica": {
+        "srodmiescie": "Śródmieście",
+        "praga polnoc": "Praga-Północ",
+        "praga poludnie": "Praga-Południe",
+        "bialoleka": "Białołęka",
+        "bemowo": "Bemowo",
+        "wola": "Wola",
+        "ursynow": "Ursynów",
+        "wlochy": "Włochy",
+        "targowek": "Targówek",
+        "mokotow": "Mokotów",
+        "ziebice": "Ziębice",
+    },
+}
 
-def _read_headers(ws) -> Dict[str, int]:
-    return { (c.value or ""): i for i, c in enumerate(ws[1], start=1) }
+# —————————————————— Narzędzia normalizacji / mapowania ——————————————————
+def norm_val(v: Any) -> str:
+    if pd.isna(v):
+        return ""
+    s = " ".join(str(v).strip().split())  # zredukuj wielokrotne spacje
+    if s.lower() in {"", "nan", "none", "null"}:
+        return ""
+    return s.casefold()
 
-def get_sheet_candidates(wb) -> List:
-    wanted = []
-    for name in ("raport", "raport_odfiltrowane"):
-        if name in wb.sheetnames:
-            wanted.append(wb[name])
-    if not wanted:
-        wanted = [wb.active]
-    return wanted
+def ensure_columns(df: pd.DataFrame, required: List[str], context: str) -> None:
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"W pliku '{context}' brakuje kolumn: {missing}. "
+            f"Dostępne kolumny: {list(df.columns)}"
+        )
 
-def complete_row_from_teryt(row_vals: Dict[str,str], teryt_rows: List[Dict[str,str]]) -> Dict[str,str]:
-    """Próby dopasowania: pełne → (woj+miejsc) → (miejsc) → (gmina). Zwraca wartości do nadpisania."""
-    w, p, g, m, d = [row_vals.get(k, "") for k in ADDR_COLS]
-    # kolejno coraz luźniejsze filtry
-    for args in [
-        (w,p,g,m,d),
-        (w,None,None,m,None),
-        (None,None,None,m,None),
-        (None,None,g,None,None),
-    ]:
-        cands = filter_candidates(teryt_rows, *args)
-        if not cands:
+def build_mask(ter: pd.DataFrame, probe: Dict[str, Any], cols_for_matching: List[str]) -> pd.Series:
+    mask = pd.Series(True, index=ter.index)
+    for c in cols_for_matching:
+        if c in probe:
+            v = norm_val(probe[c])
+            if v != "":
+                mask = mask & (ter[f"{c}__norm"] == v)
+    return mask
+
+def concat_address(row: pd.Series, cols: List[str]) -> str:
+    parts = []
+    for c in ["Województwo", "Powiat", "Gmina", "Miejscowość", "Dzielnica", "Ulica"]:
+        if c in cols:
+            val = str(row.get(c, "")).strip()
+            if val and val.lower() not in {"nan", "none", "null"}:
+                parts.append(val)
+    return ", ".join(parts)
+
+def _strip_ulica_prefixes(name: str) -> str:
+    # usuń częste prefiksy: ul., UL., ul  — oraz standaryzuj skróty al./pl./os.
+    s = name.strip()
+    low = s.casefold()
+    for pref in ["ul.", "ul ", "ul. ", "ulica ", "ul "]:
+        if low.startswith(pref):
+            s = s[len(pref):].lstrip()
+            break
+    return " ".join(s.split())
+
+def load_custom_mapping(path: Path) -> Dict[Optional[str], Dict[str, str]]:
+    """
+    Wczytuje CSV/XLSX o kolumnach:
+      - 'stara' (wymagana)
+      - 'nowa'  (wymagana)
+      - 'kolumna' (opcjonalna: np. 'Województwo', 'Miejscowość'; jeśli brak → mapowanie globalne)
+    Zwraca strukturę jak BUILTIN_NAME_MAP.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"Nie znaleziono pliku mapowania: {path}")
+    if path.suffix.lower() in {".xlsx", ".xlsm"}:
+        df = pd.read_excel(path, dtype=str)
+    else:
+        df = pd.read_csv(path, dtype=str, sep=None, engine="python")
+    for required in ["stara", "nowa"]:
+        if required not in df.columns:
+            raise ValueError(f"Plik mapowania musi mieć kolumnę '{required}'.")
+    result: Dict[Optional[str], Dict[str, str]] = {}
+    for _, r in df.iterrows():
+        old = norm_val(r["stara"])
+        new = str(r["nowa"]).strip()
+        col = str(r["kolumna"]).strip() if "kolumna" in df.columns and pd.notna(r["kolumna"]) else None
+        if not old or not new:
             continue
-        if len(cands) == 1:
-            return cands[0]
-        stab = stable_values(cands)
-        if stab:
-            return {**{k:"" for k in ADDR_COLS}, **stab}
-    return {}
+        bucket = result.setdefault(col if col in ADDR_COLS else None, {})
+        bucket[old] = new
+    return result
 
-def process_workbook(in_xlsx: Path, teryt_xlsx: Path, nrkw_xlsx: Path) -> Tuple[int,int]:
+def make_name_resolver(custom_map: Optional[Dict[Optional[str], Dict[str, str]]] = None):
     """
-    Zwraca (ile_uzupełniono_adresem, ile_oznaczono_brak_adresu)
+    Tworzy funkcję fix_name(value, column) zwracającą poprawioną nazwę wg:
+    1) mapowań kolumnowych (custom → builtin),
+    2) mapowań globalnych,
+    3) lekkiej normalizacji (spacje, prefiksy 'ul.').
     """
-    wb = load_workbook(in_xlsx)
-    teryt_rows = load_teryt(teryt_xlsx)
-    kw_map = load_kw_voiv_mapping(nrkw_xlsx) if nrkw_xlsx.exists() else {}
+    merged: Dict[Optional[str], Dict[str, str]] = {}
+    # start od wbudowanych
+    for k, v in BUILTIN_NAME_MAP.items():
+        merged[k] = dict(v)
+    # nadpisz/custom
+    if custom_map:
+        for k, v in custom_map.items():
+            merged.setdefault(k, {})
+            merged[k].update({norm_val(kk): vv for kk, vv in v.items()})
 
-    updated_addr = 0
-    marked_missing = 0
+    def fix_name(value: Any, column: str) -> str:
+        raw = "" if pd.isna(value) else str(value)
+        clean = " ".join(raw.strip().split())
+        key = norm_val(clean)
 
-    for ws in get_sheet_candidates(wb):
-        # upewnij się, że nagłówki istnieją
-        hdr = _read_headers(ws)
-        for col in [KW_COL] + ADDR_COLS + VALUE_COLS:
-            if col not in hdr:
-                find_or_create_column(ws, col)
-        hdr = _read_headers(ws)
+        # specyficzne dla ulic
+        if column == "Ulica":
+            clean = _strip_ulica_prefixes(clean)
+            key = norm_val(clean)
 
-        col_idx = {k: hdr[k] for k in [KW_COL] + ADDR_COLS + VALUE_COLS}
+        # 1) kolumnowe
+        colmap = merged.get(column, {})
+        if key in colmap:
+            return colmap[key]
 
-        for r in range(2, ws.max_row + 1):
-            cell = lambda name: ws.cell(row=r, column=col_idx[name])
+        # 2) globalne
+        glob = merged.get(None, {})
+        if key in glob:
+            return glob[key]
 
-            nr_kw_val = str(cell(KW_COL).value or "").strip()
-            adr_vals = {k: str(cell(k).value or "").strip() for k in ADDR_COLS}
+        # 3) brak mapy — zwróć oczyszczoną wartość (np. bez 'ul.')
+        return clean
 
-            # warunek "tylko Miejscowość"
-            only_miejsc = (adr_vals["Miejscowość"] != "") and all(
-                not adr_vals[k] for k in ["Województwo","Powiat","Gmina","Dzielnica"]
-            )
+    return fix_name
 
-            if only_miejsc and nr_kw_val and kw_map:
-                pref = kw_prefix(nr_kw_val)
-                woj = kw_map.get(pref, "")
-                if woj:
-                    ws.cell(row=r, column=col_idx["Województwo"], value=woj)
-                    adr_vals["Województwo"] = woj  # do dopasowania TERYT
+# —————————————————— Główna procedura ——————————————————
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Dopasowanie adresów z TERYT + korekta starych nazw na nowe.")
+    parser.add_argument("--we", "--wejscie", dest="wejscie", required=True, help="Ścieżka do pliku wejściowego Excel.")
+    parser.add_argument("--teryt", dest="teryt", required=True, help="Ścieżka do pliku TERYT.xlsx.")
+    parser.add_argument("--arkusz", dest="arkusz", default=0, help="Nazwa lub indeks arkusza (domyślnie pierwszy).")
+    parser.add_argument("--zapis", dest="zapis", required=True, help="Ścieżka pliku wyjściowego Excel.")
+    parser.add_argument("--mapa", dest="mapa", default=None,
+                        help="OPCJONALNIE: plik CSV/XLSX z kolumnami: stara, nowa[, kolumna] – dodatkowe mapowania nazw.")
+    args = parser.parse_args()
 
-            # próba uzupełnienia z TERYT (jeśli cokolwiek mamy)
-            filled = complete_row_from_teryt(adr_vals, teryt_rows)
-            if filled:
-                changed = False
-                for k in ADDR_COLS:
-                    newv = filled.get(k, "")
-                    if newv and str(cell(k).value or "").strip() != str(newv).strip():
-                        cell(k).value = newv
-                        changed = True
-                if changed:
-                    updated_addr += 1
-
-            # po wszystkich próbach: jeśli adres PUSTY wszędzie → wpisz "brak adresu" w 3 kolumnach
-            adr_vals_after = {k: str(cell(k).value or "").strip() for k in ADDR_COLS}
-            if all(v == "" for v in adr_vals_after.values()):
-                for k in VALUE_COLS:
-                    cell(k).value = "brak adresu"
-                marked_missing += 1
-
-    wb.save(in_xlsx)
-    return updated_addr, marked_missing
-
-# ============================= CLI =============================
-
-def resolve_side_file(preferred_dir: Path, fallback_dir: Path, filename: str) -> Path:
-    for base in (preferred_dir, fallback_dir):
-        p = base / filename
-        if p.exists():
-            return p
-    # zwróć ścieżkę w preferred_dir (może nie istnieć – przekażemy użytkownikowi komunikat)
-    return preferred_dir / filename
-
-def main():
-    ap = argparse.ArgumentParser(description=APP_TITLE)
-    ap.add_argument("--in", dest="infile", required=True, help="Plik Excel do poprawy (od Sortowni)")
-    ap.add_argument("--teryt", dest="teryt", default=None, help="Ścieżka do TERYT.xlsx (opcjonalnie)")
-    ap.add_argument("--nrkw", dest="nrkw", default=None, help="Ścieżka do 'Nr KW.xlsx' (opcjonalnie)")
-    args = ap.parse_args()
-
-    in_xlsx = Path(args.infile).expanduser().resolve()
-    if not in_xlsx.exists():
-        _err(f"Nie znaleziono pliku wejściowego: {in_xlsx}")
-        sys.exit(2)
-
-    # domyślne lokalizacje: najpierw folder pliku wejściowego, potem folder skryptu
-    here = Path(__file__).resolve().parent
-    teryt_path = Path(args.teryt).resolve() if args.teryt else resolve_side_file(in_xlsx.parent, here, TERYT_DEFAULT)
-    nrkw_path  = Path(args.nrkw).resolve()  if args.nrkw  else resolve_side_file(in_xlsx.parent, here, NR_KW_DEFAULT)
-
-    if not teryt_path.exists():
-        _err(f"Brak pliku TERYT: {teryt_path}\nUmieść TERYT.xlsx obok pliku wejściowego lub wskaż --teryt.")
-        sys.exit(3)
-
-    if not nrkw_path.exists():
-        _info(f"Uwaga: nie znaleziono '{NR_KW_DEFAULT}' ({nrkw_path}).\n"
-              f"Uzupełnianie województwa z prefiksu Nr KW będzie pominięte.\n"
-              f"Adres spróbujemy uzupełnić tylko na podstawie TERYT i miejscowości.")
+    # wejście
+    try:
+        df = pd.read_excel(args.wejscie, sheet_name=args.arkusz, dtype=str)
+    except Exception as e:
+        print(f"Nie udało się wczytać pliku wejściowego: {e}", file=sys.stderr)
+        return 2
 
     try:
-        updated, missing = process_workbook(in_xlsx, teryt_path, nrkw_path)
+        teryt = pd.read_excel(args.teryt, dtype=str)
     except Exception as e:
-        _err(f"Nie udało się przetworzyć pliku:\n{e}")
-        sys.exit(1)
+        print(f"Nie udało się wczytać pliku TERYT: {e}", file=sys.stderr)
+        return 2
 
-    _info(f"Zakończono.\n"
-          f"Uzupełniono adresy w wierszach: {updated}\n"
-          f"Oznaczono 'brak adresu' w wierszach: {missing}\n\n"
-          f"Plik: {in_xlsx}")
+    ensure_columns(df, [COL_NR_KW] + ADDR_COLS + PRICE_COLS, context=args.wejscie)
+    base_teryt_cols = ["Województwo", "Powiat", "Gmina", "Miejscowość", "Dzielnica"]
+    ensure_columns(teryt, base_teryt_cols, context=args.teryt)
+
+    # przygotuj kolumny znormalizowane w TERYT (do filtrowania)
+    teryt_has_ulica = "Ulica" in teryt.columns
+    for c in base_teryt_cols + (["Ulica"] if teryt_has_ulica else []):
+        teryt[f"{c}__norm"] = teryt[c].apply(norm_val) if c in teryt.columns else ""
+
+    # ewentualnie dodaj brakujące kolumny cenowe w wejściu
+    for col in PRICE_COLS:
+        if col not in df.columns:
+            df[col] = ""
+
+    # wczytaj dodatkowe mapowania (jeśli podano)
+    custom_map = None
+    if args.mapa:
+        try:
+            custom_map = load_custom_mapping(Path(args.mapa))
+        except Exception as e:
+            print(f"Uwaga: nie udało się wczytać mapowania '{args.mapa}': {e}", file=sys.stderr)
+
+    # stwórz resolver nazw i zastosuj go do kolumn adresowych wejścia
+    fix_name = make_name_resolver(custom_map)
+    for c in ADDR_COLS:
+        if c in df.columns:
+            df[c] = df[c].apply(lambda v, col=c: fix_name(v, col))
+
+    processed = 0
+    for idx, row in df.iterrows():
+        nr_kw = norm_val(row[COL_NR_KW])
+        if nr_kw == "":
+            continue
+        processed += 1
+
+        addr_values = {c: row.get(c, "") for c in ADDR_COLS}
+        filled_count = sum(1 for c, v in addr_values.items() if norm_val(v) != "")
+
+        if filled_count == 0:
+            for col in PRICE_COLS:
+                df.at[idx, col] = "brak adresu"
+            continue
+
+        if filled_count == 2:
+            probe = {c: addr_values.get(c, "") for c in base_teryt_cols}
+            cols_for_matching = [c for c in base_teryt_cols if norm_val(probe[c]) != ""]
+            if not cols_for_matching:
+                for col in PRICE_COLS:
+                    df.at[idx, col] = "brak adresu"
+                continue
+
+            mask = build_mask(teryt, probe, cols_for_matching)
+            candidates = teryt[mask]
+
+            if len(candidates) == 1:
+                for c in base_teryt_cols:
+                    if norm_val(df.at[idx, c]) == "":
+                        df.at[idx, c] = candidates.iloc[0][c]
+                if teryt_has_ulica and norm_val(df.at[idx, "Ulica"]) == "" and "Ulica" in candidates.columns:
+                    df.at[idx, "Ulica"] = candidates.iloc[0].get("Ulica", "")
+            elif len(candidates) > 1:
+                addr_list = []
+                for _, r in candidates.iterrows():
+                    addr_list.append(concat_address(r, base_teryt_cols + (["Ulica"] if teryt_has_ulica else [])))
+                unique_addrs = sorted(set(a for a in addr_list if a))
+                multi = " | ".join(unique_addrs[:50])
+                for col in PRICE_COLS:
+                    df.at[idx, col] = multi if multi else "brak adresu"
+            else:
+                for col in PRICE_COLS:
+                    df.at[idx, col] = "brak adresu"
+            continue
+
+        if filled_count >= 3:
+            probe = {c: addr_values.get(c, "") for c in base_teryt_cols + (["Ulica"] if teryt_has_ulica else [])}
+            cols_for_matching = [c for c, v in probe.items() if norm_val(v) != ""]
+            if not cols_for_matching:
+                for col in PRICE_COLS:
+                    df.at[idx, col] = "brak adresu"
+                continue
+
+            mask = build_mask(teryt, probe, cols_for_matching)
+            candidates = teryt[mask]
+
+            if len(candidates) == 1:
+                for c in base_teryt_cols:
+                    if norm_val(df.at[idx, c]) == "":
+                        df.at[idx, c] = candidates.iloc[0][c]
+                if teryt_has_ulica:
+                    if norm_val(df.at[idx, "Ulica"]) == "" and "Ulica" in candidates.columns:
+                        df.at[idx, "Ulica"] = candidates.iloc[0].get("Ulica", "")
+            elif len(candidates) > 1:
+                addr_list = []
+                for _, r in candidates.iterrows():
+                    addr_list.append(concat_address(r, base_teryt_cols + (["Ulica"] if teryt_has_ulica else [])))
+                unique_addrs = sorted(set(a for a in addr_list if a))
+                multi = " | ".join(unique_addrs[:50])
+                for col in PRICE_COLS:
+                    df.at[idx, col] = multi if multi else "brak adresu"
+            else:
+                for col in PRICE_COLS:
+                    df.at[idx, col] = "brak adresu"
+            continue
+
+    try:
+        with pd.ExcelWriter(args.zapis, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False)
+    except Exception as e:
+        print(f"Nie udało się zapisać pliku wyjściowego: {e}", file=sys.stderr)
+        return 2
+
+    print(f"Zakończono. Przetworzono wierszy z Nr KW: {processed}. Zapisano: {args.zapis}")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

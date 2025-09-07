@@ -26,6 +26,9 @@ COL_MEAN_M2_ADJ  = "Średnia skorygowana cena za m² (z bazy)"        # po IQR
 COL_PROP_VALUE   = "Statystyczna wartość nieruchomości"             # skorygowana × metry
 RESULT_COLS = [COL_MEAN_M2, COL_MEAN_M2_ADJ, COL_PROP_VALUE]
 
+# NOWE: komunikat dla zbyt małej liczby ogłoszeń
+MSG_NO_SIMILAR = "brak podobnych ogłoszeń"
+
 REQUIRED_REPORT_COLUMNS = [
     "Nr KW","Typ Księgi","Stan Księgi","Województwo","Powiat","Gmina","Miejscowość","Dzielnica",
     "Położenie","Nr działek po średniku","Obręb po średniku","Ulica","Sposób korzystania","Obszar",
@@ -422,6 +425,14 @@ class Aplikacja(tk.Tk):
             self._write_results_to_report(mean_raw_m2=None, mean_adj_m2=None, prop_value=None)
             return
 
+        # NOWE: jeżeli w zakresie metrażu jest < 5 ogłoszeń → wpisz komunikat i zakończ
+        n_matches = len(df_filt)
+        if n_matches < 5:
+            self.txt.insert("end", f"Liczba ogłoszeń w zakresie metrażu dla: {human}='{level_value or '—'}' to {n_matches} (< 5).\n")
+            self.txt.insert("end", f"Wpisano w raporcie: „{MSG_NO_SIMILAR}”.\n")
+            self._write_results_to_report(override_text=MSG_NO_SIMILAR)
+            return
+
         # 1) ŚREDNIA SUROWA (bez IQR)
         mean_raw_m2 = wm.mean_numeric(df_filt["cena_za_metr"])
 
@@ -447,7 +458,13 @@ class Aplikacja(tk.Tk):
         self.txt.insert("end", "Wyniki zapisane w raporcie (w 1. wierszu danych) w kolumnach:\n"
                                f"  - {COL_MEAN_M2}\n  - {COL_MEAN_M2_ADJ}\n  - {COL_PROP_VALUE}\n")
 
-    def _write_results_to_report(self, mean_raw_m2: Optional[float], mean_adj_m2: Optional[float], prop_value: Optional[float]):
+    def _write_results_to_report(
+        self,
+        mean_raw_m2: Optional[float] = None,
+        mean_adj_m2: Optional[float] = None,
+        prop_value: Optional[float] = None,
+        override_text: Optional[str] = None
+    ):
         if self.report_path is None or self.report_sheet is None:
             return
         rp = self.report_path
@@ -455,9 +472,12 @@ class Aplikacja(tk.Tk):
 
         df = ensure_report_columns_and_append_results(rp, sh)
 
-        s_mean_raw = wm.format_price_per_m2(mean_raw_m2) if mean_raw_m2 is not None else "—"
-        s_mean_adj = wm.format_price_per_m2(mean_adj_m2) if mean_adj_m2 is not None else "—"
-        s_prop_val = wm.format_currency(prop_value) if prop_value is not None else "—"
+        if override_text is not None:
+            s_mean_raw = s_mean_adj = s_prop_val = override_text
+        else:
+            s_mean_raw = wm.format_price_per_m2(mean_raw_m2) if mean_raw_m2 is not None else "—"
+            s_mean_adj = wm.format_price_per_m2(mean_adj_m2) if mean_adj_m2 is not None else "—"
+            s_prop_val = wm.format_currency(prop_value) if prop_value is not None else "—"
 
         if df.empty:
             df = pd.DataFrame(columns=df.columns)

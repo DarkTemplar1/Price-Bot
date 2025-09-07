@@ -27,10 +27,7 @@ from typing import Iterable, List
 
 # ===== Lista województw =====
 WOJEWODZTWA: List[str] = [
-    "Dolnośląskie", "Kujawsko-Pomorskie", "Lubelskie", "Lubuskie",
-    "Łódzkie", "Małopolskie", "Mazowieckie", "Opolskie",
-    "Podkarpackie", "Podlaskie", "Pomorskie", "Śląskie",
-    "Świętokrzyskie", "Warmińsko-Mazurskie", "Wielkopolskie", "Zachodniopomorskie",
+    "Warmińsko-Mazurskie", "Wielkopolskie", "Zachodniopomorskie",
 ]
 
 # ===== Ścieżki bazowe =====
